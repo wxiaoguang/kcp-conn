@@ -133,7 +133,6 @@ static void run(event_base *evbase) {
     delete tcp;
     delete kcp;
 
-    evutil_closesocket(fd);
     evutil_closesocket(fdTcpServer);
 }
 
