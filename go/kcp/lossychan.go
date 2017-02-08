@@ -9,9 +9,12 @@ import (
 type LossyTrick interface {
     DelayMs() int
     LossRatio() float64
+
+    // limit item per second, or for []byte limit bytes per second
+    LimitPerSecond() int
 }
 
-func LossyChannel(ch chan interface{}, sz int, nt LossyTrick) chan interface{} {
+func LossyChannel(name string, ch chan interface{}, sz int, nt LossyTrick) chan interface{} {
     q := make([][]interface{}, 5000)
     n := 0
 
@@ -22,14 +25,17 @@ func LossyChannel(ch chan interface{}, sz int, nt LossyTrick) chan interface{} {
 
     var total int64
     var loss int64
+    var dropSpeed int64
+    var dropOut int64
 
     go func() {
         var tmr *time.Ticker
+        var speedLimit time.Time
 
         tmr = time.NewTicker(time.Millisecond / 10)
+
         for ch != nil || n != 0 {
             select {
-
             case v := <- ch:
 
                 if v == nil {
@@ -43,6 +49,25 @@ func LossyChannel(ch chan interface{}, sz int, nt LossyTrick) chan interface{} {
                     loss++
                     continue
                 }
+
+                sz := 1
+                if b, ok := v.([]byte); ok {
+                    sz = len(b)
+                }
+
+                limitPerSec := nt.LimitPerSecond()
+                if limitPerSec != 0 {
+                    now := time.Now()
+                    if speedLimit.IsZero() {
+                        speedLimit = now
+                    }
+                    if now.Before(speedLimit) {
+                        dropSpeed++
+                        continue
+                    }
+                    speedLimit = speedLimit.Add(time.Duration(sz) * time.Second / time.Duration(limitPerSec))
+                }
+
 
                 d := nt.DelayMs()
                 idx := (curIdx + d) % len(q)
@@ -64,7 +89,7 @@ func LossyChannel(ch chan interface{}, sz int, nt LossyTrick) chan interface{} {
                         case <-time.After(time.Millisecond * 5):
                             r := len(q[idx]) - j
                             n -= r
-                            loss += int64(r)
+                            dropOut += int64(r)
                             break loop
                         }
                     }
@@ -75,7 +100,7 @@ func LossyChannel(ch chan interface{}, sz int, nt LossyTrick) chan interface{} {
             }
         }
 
-        fmt.Printf("LossyChannel closed. total=%d, loss=%d\n", total, loss)
+        fmt.Printf("LossyChannel %s closed. total=%d, loss=%d, dropSpeed=%d, dropOut=%d\n", name, total, loss, dropSpeed, dropOut)
         close(out)
     }()
     return out

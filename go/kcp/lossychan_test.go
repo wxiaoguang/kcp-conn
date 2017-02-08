@@ -18,12 +18,16 @@ func (t *testChanTrick) LossRatio() float64 {
     return 0.3
 }
 
+func (t *testChanTrick) LimitPerSecond() int {
+    return 100
+}
+
 func TestLossyChannel(test *testing.T) {
     sz := 32
     trick := &testChanTrick{}
 
     chOrig := make(chan interface{}, sz)
-    chHijacked := LossyChannel(chOrig, sz, trick)
+    chHijacked := LossyChannel("", chOrig, sz, trick)
 
     recvCount := 0;
     wg := sync.WaitGroup{}
@@ -43,11 +47,12 @@ func TestLossyChannel(test *testing.T) {
         wg.Done()
     }()
 
-    tm := time.Now()
-    count := 20000
+    count := 200
     for i := 0; i < count; i++ {
         chOrig <- time.Now()
-        fmt.Printf("send = %d us\n", int(time.Now().Sub(tm).Seconds() * 1000000)) //make same cpu usage as the recv routine
+
+        delay := time.Second / time.Duration(trick.LimitPerSecond())
+        time.Sleep(delay / 2) // twice faster, remote should only recv half
     }
     close(chOrig)
     wg.Wait()

@@ -19,17 +19,20 @@ type lossyConn struct {
 
     deadlineRead time.Time
     deadlineWrite time.Time
+
+    die chan struct{}
 }
 
 func NewLossyConn(conn net.Conn, channelSize int, readTrick, writeTrick LossyTrick) *lossyConn {
     c := &lossyConn{conn: conn}
 
+    c.die = make(chan struct{}, 1)
     c.chRead = make(chan interface{}, channelSize)
-    c.chReadTricked = LossyChannel(c.chRead, channelSize, readTrick)
+    c.chReadTricked = LossyChannel("read", c.chRead, channelSize, readTrick)
     c.readBuf = &bytes.Buffer{}
 
     c.chWrite = make(chan interface{}, channelSize)
-    c.chWriteTricked = LossyChannel(c.chWrite, channelSize, writeTrick)
+    c.chWriteTricked = LossyChannel("write", c.chWrite, channelSize, writeTrick)
 
     go func() {
         for v := range c.chWriteTricked {
@@ -39,28 +42,31 @@ func NewLossyConn(conn net.Conn, channelSize int, readTrick, writeTrick LossyTri
     }()
 
     go func() {
-        for {
-            c.startRead()
+        loop:
+        for c.chWrite != nil {
+            b := make([]byte, 4 * 1024)
+            c.conn.SetReadDeadline(time.Now().Add(900 * time.Millisecond))
+            n, err := c.conn.Read(b)
+            if e, ok := err.(net.Error); ok && e.Timeout() {
+                continue
+            }
+
+            if n == 0 || err != nil{
+                break loop
+            }
+
+            select {
+            case c.chRead <- b[:n]:
+            case <- c.die:
+                break loop
+            }
         }
+        close(c.chRead)
     }()
 
     return c
 }
 
-func (c *lossyConn) startRead() (n int, err error){
-    b := make([]byte, 2048)
-    n, err = c.conn.Read(b)
-    if e, ok := err.(net.Error); ok && e.Timeout() {
-        return
-    }
-
-    if n == 0 || err != nil {
-        close(c.chRead)
-        return 0, io.EOF
-    }
-    c.chRead <- b[:n]
-    return n, err
-}
 
 func (c *lossyConn) Read(b []byte) (n int, err error) {
     n, _ = c.readBuf.Read(b)
@@ -81,11 +87,11 @@ func (c *lossyConn) Read(b []byte) (n int, err error) {
 
     select {
     case v := <- c.chReadTricked:
-        p := v.([]byte)
-        if p == nil {
+        if v == nil {
             return 0, io.EOF
         }
 
+        p := v.([]byte)
         n, _ = c.readBuf.Write(p)
         n, _ = c.readBuf.Read(b)
     case <-timer.C:
@@ -129,6 +135,13 @@ func (c *lossyConn) Write(b []byte) (n int, err error) {
 // Close closes the connection.
 // Any blocked Read or Write operations will be unblocked and return errors.
 func (c *lossyConn) Close() error {
+    close(c.die)
+
+    if c.chWrite != nil {
+        close(c.chWrite)
+        c.chWrite = nil
+    }
+
     return c.conn.Close()
 }
 
