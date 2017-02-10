@@ -10,6 +10,7 @@ import (
     "math/rand"
     "errors"
     "sync/atomic"
+    "log"
 )
 
 type testConnTrick struct {
@@ -58,21 +59,21 @@ func (c *testMockLossyConn) feed() bool {
     }
 }
 
-func (c *testMockLossyConn) Read(b []byte) (n int, err error) {
+func (c *testMockLossyConn) ReadFrom(b []byte) (n int, addr net.Addr, err error) {
     select {
     case tmp := <- c.chFeed:
         if len(b) < len(tmp) {
             panic("not enough buffer")
         }
         copy(b, tmp)
-        return len(tmp), nil
+        return len(tmp), nil, nil
     case <- time.After(500 * time.Millisecond):
-        return 0, errTimeout{}
+        return 0, nil, errTimeout{}
     }
-    return 0, errors.New(errBrokenPipe)
+    return 0, nil, errors.New(errBrokenPipe)
 }
 
-func (c *testMockLossyConn) Write(b []byte) (n int, err error) {
+func (c *testMockLossyConn) WriteTo(b []byte, addr net.Addr) (n int, err error) {
     c.countWrite++
     s := string(b)
     now := testLossyConnNowMs()
@@ -85,9 +86,6 @@ func (c *testMockLossyConn) Close() error {
     return nil
 }
 func (c *testMockLossyConn) LocalAddr() net.Addr {
-    return nil
-}
-func (c *testMockLossyConn) RemoteAddr() net.Addr {
     return nil
 }
 func (c *testMockLossyConn) SetDeadline(t time.Time) error {
@@ -124,7 +122,7 @@ func TestLossyConnReadWrite(test *testing.T) {
 
         buf := make([]byte, 4096)
         nc.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-        n, err := nc.Read(buf)
+        n, _, err := nc.ReadFrom(buf)
         if err != nil {
             fmt.Printf("read err=%v\n", err)
             countReadLoss++
@@ -138,7 +136,7 @@ func TestLossyConnReadWrite(test *testing.T) {
         }
 
         now := testLossyConnNowMs()
-        nc.Write([]byte(strconv.Itoa(now)))
+        nc.WriteTo([]byte(strconv.Itoa(now)), nil)
     }
     nc.Close()
 
@@ -166,7 +164,7 @@ func TestLossyConnSpeed(test *testing.T) {
     go func() {
         buf := make([]byte, 4096)
         for {
-            n, _ := nc.Read(buf)
+            n, _, _ := nc.ReadFrom(buf)
             atomic.AddInt64(&totalSize, int64(n))
         }
     }()
@@ -179,5 +177,48 @@ func TestLossyConnSpeed(test *testing.T) {
 
     nc.Close()
     <- time.After(1 * time.Second)
+
+}
+
+
+
+func TestLossyPairConnSpeed(test *testing.T) {
+    trick1 := &testConnTrick{delayMs: 200, lossRatio: 0.02}
+    trick2 := &testConnTrick{delayMs: 200, lossRatio: 0.02}
+
+    lc1, lc2 := NewLossyPairConn(1024, trick1, trick2)
+
+    closed := false
+    go func() {
+        b := make([]byte, 4096)
+        for !closed {
+            lc1.WriteTo(b, nil)
+        }
+    }()
+
+    recvSize := int64(0)
+    go func() {
+        b := make([]byte, 4096)
+        for !closed {
+            n, _, _ := lc2.ReadFrom(b)
+            atomic.AddInt64(&recvSize, int64(n))
+        }
+    }()
+
+    ch := make(chan int, 1)
+    go func() {
+        for i := 0; i < 3; i++ {
+            start := time.Now()
+            time.Sleep(time.Second)
+            sz := atomic.SwapInt64(&recvSize, 0)
+            mb := (float64(sz)/1024.0/1024.0)
+            d := time.Now().Sub(start)
+            log.Printf("time for %.2f MB : %v, speed=%.2f MB/s\n", mb, d, mb / d.Seconds())
+        }
+        close(ch)
+    }()
+
+    <- ch
+    closed = true
 
 }

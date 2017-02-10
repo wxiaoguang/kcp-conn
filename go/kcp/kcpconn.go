@@ -9,8 +9,8 @@ import (
     "time"
     "errors"
     "log"
-    "fmt"
     "math"
+    "io"
 )
 
 type errTimeout struct {
@@ -49,6 +49,7 @@ type (
     KCPConn struct {
         kcp               *KCP           // the core ARQ
         listener          *Listener      // point to server listener if it's a server socket
+        isClient          bool
         conn              net.PacketConn // the underlying packet socket
         remoteAddr        net.Addr
 
@@ -103,6 +104,7 @@ func newKCPConn() *KCPConn {
 
 func (s *KCPConn) accept(conv uint32, l *Listener, conn net.PacketConn, remote net.Addr) {
     s.listener = l
+    s.isClient = false
     s.conn = conn
     s.remoteAddr = remote
     s.kcp.conv = conv
@@ -111,10 +113,13 @@ func (s *KCPConn) accept(conv uint32, l *Listener, conn net.PacketConn, remote n
 }
 
 func (s *KCPConn) connect(conv uint32, conn net.PacketConn, remote net.Addr) {
+    s.isClient = true
     s.conn = conn
     s.remoteAddr = remote
     s.kcp.conv = conv
     atomic.AddInt64(&Stats.TotalConnect, 1)
+
+    s.goRunClientRecv()
     go s.run();
 
     s.mu.Lock()
@@ -123,23 +128,33 @@ func (s *KCPConn) connect(conv uint32, conn net.PacketConn, remote net.Addr) {
     <- s.chWriteEvent
 }
 
+func (s *KCPConn) dump() {
+    s.mu.Lock()
+    role := "server"
+    if s.isClient {
+        role = "client"
+    }
+
+    log.Printf("-- role=%s (%p) --\n", role, s)
+    log.Printf("stats: %+v\n", s.kcp.stats)
+    log.Printf("isLocalOpen=%v, isRemoteOpen=%v\n", !s.kcp.isStateLocalClosed(), s.kcp.isRemoteOpen())
+    log.Printf("snd_nxt=%d, WaitSnd=%d\n", s.kcp.snd_nxt, s.kcp.waitSnd())
+    log.Printf("rcv_nxt=%d, rcv_queue=%d, rcv_buf=%d\n", s.kcp.rcv_nxt, len(s.kcp.rcv_queue), len(s.kcp.rcv_buf))
+    log.Println()
+    s.mu.Unlock()
+}
+
 func (s *KCPConn) debug() {
     loop:
     for {
         select {
         case <-s.die:
-            log.Printf("-- listener=%p --\n", s.listener)
-            log.Print("close\n")
+            log.Printf("%p stats: %+v\n", s, s.kcp.stats)
+            log.Printf("%p close\n", s)
             break loop
 
         case <-time.After(time.Second):
-            s.mu.Lock()
-            log.Printf("-- listener=%p --\n", s.listener)
-            log.Printf("WaitSnd=%d\n", s.kcp.waitSnd())
-            log.Printf("rcv_nxt=%d\n", s.kcp.rcv_nxt)
-            log.Printf("rcv_queue=%d\n", len(s.kcp.rcv_queue))
-            log.Printf("rcv_buf=%d\n", len(s.kcp.rcv_buf))
-            s.mu.Unlock()
+            s.dump()
         }
     }
 }
@@ -165,7 +180,7 @@ func (s *KCPConn) Read(b []byte) (int, error) {
 
         shouldClose := s.kcp.shouldClose()
         if shouldClose {
-            fmt.Printf("kcp %p Read should close\n", s.listener)
+            //fmt.Printf("kcp Read should close\n")
             s.closeInternal()
         }
 
@@ -176,12 +191,7 @@ func (s *KCPConn) Read(b []byte) (int, error) {
         }
 
         if s.kcp.isStateLocalClosed() {
-            s.mu.Unlock()
-            if shouldClose {
-                return 0, nil
-            } else {
-                return 0, errors.New(errBrokenPipe)
-            }
+            return 0, io.EOF
         }
 
         var timeout *time.Timer
@@ -211,7 +221,7 @@ func (s *KCPConn) Read(b []byte) (int, error) {
 }
 
 func (s *KCPConn) canKcpSendInternal() bool {
-    return (s.kcp.waitSnd() * s.kcp.mss < kcpSendBufferLimit) && s.kcp.isStateConnected()
+    return s.kcp.waitSnd() < int(s.kcp.snd_wnd) && s.kcp.isStateConnected()
 }
 
 // Write implements the Conn Write method.
@@ -235,7 +245,7 @@ func (s *KCPConn) Write(b []byte) (int, error) {
             atomic.AddInt64(&Stats.ByteTx, int64(len(b)))
 
             if s.kcp.sndBufAvail() > 0 {
-                s.notifyFlushEvent()
+            s.notifyFlushEvent()
             }
 
             return len(b), nil
@@ -302,9 +312,11 @@ func (s *KCPConn) doKcpInput(data []byte) bool {
         s.notifyWriteEvent()
     }
 
-    if n := s.kcp.recvSize(); n > 0 {
+    n := s.kcp.recvSize()
+    if n > 0 || s.kcp.shouldClose() {
         s.notifyReadEvent()
     }
+
     udpPacketPool.Put(data)
 
     s.kcp.stats.PacketIn += 1
@@ -312,6 +324,26 @@ func (s *KCPConn) doKcpInput(data []byte) bool {
     atomic.AddInt64(&Stats.PacketIn, 1)
     atomic.AddInt64(&Stats.ByteIn, int64(len(data)))
     return true
+}
+
+func (s *KCPConn) goRunClientRecv() {
+    go func() {
+        for {
+            data := udpPacketPool.Get().([]byte)[:udpPacketSizeLimit]
+            if n, _, err := s.conn.ReadFrom(data); err == nil {
+                select {
+                case s.chUdpInput <- data[:n]:
+                case <-s.die:
+                }
+            } else if err != nil {
+                //FIXME: what to do ?
+                log.Printf("client=%v udp read error: %v\n", s.isClient, err)
+                s.kcp.stats.ErrorRead += 1
+                atomic.AddInt64(&Stats.ErrorRead, 1)
+                return
+            }
+        }
+    }()
 }
 
 func (s *KCPConn) run() {
@@ -326,28 +358,6 @@ func (s *KCPConn) run() {
     //var lastPing time.Time
     //ticker := time.NewTicker(5 * time.Second)
     //defer ticker.Stop()
-
-    //for client
-    if s.listener == nil {
-        go func() {
-            for {
-                data := udpPacketPool.Get().([]byte)[:udpPacketSizeLimit]
-                if n, _, err := s.conn.ReadFrom(data); err == nil {
-                    select {
-                    case s.chUdpInput <- data[:n]:
-                    case <-s.die:
-                    }
-                } else if err != nil {
-                    //FIXME: what to do ?
-                    log.Printf("client udp read error: %v\n", err)
-                    s.kcp.stats.ErrorRead += 1
-                    atomic.AddInt64(&Stats.ErrorRead, 1)
-                    close(s.chUdpInput)
-                    return
-                }
-            }
-        }()
-    }
 
     // main loop
     updateDelayMax := 1000 * time.Millisecond
@@ -368,6 +378,11 @@ func (s *KCPConn) run() {
         }
 
         s.mu.Lock()
+
+        if s.kcp.sndBufAvail() > 0 {
+            doKcpFlush = true
+        }
+
         if doKcpFlush {
             s.kcp.flush(currentTickMs())
         } else {
@@ -380,7 +395,7 @@ func (s *KCPConn) run() {
 
         doKcpFlush = false
         select {
-        case data := <- s.chUdpInput:
+        case data := <-s.chUdpInput:
             s.doKcpInput(data)
             updateDelay = updateDelay / 2
 
@@ -397,9 +412,11 @@ func (s *KCPConn) run() {
     }
 
     atomic.AddInt64(&Stats.ConnClosing, 1)
-    //fmt.Printf("kcp l=%p conn close\n", s.listener)
+    //fmt.Printf("kcp conn close\n")
 
-    s.kcp.sendCloseFlush(currentTickMs())
+    if !s.kcp.isStateLocalClosed() {
+        s.kcp.sendCloseFlush(currentTickMs())
+    }
 
     var closeWaitStartTime time.Time
     dangling := true
@@ -587,14 +604,14 @@ func (s *KCPConn) kcpOutput(buf []byte, size int) {
 
     //mutex already locked
     if err == nil {
-        //FIXME: what to do?
-        s.kcp.stats.ErrorOutput += 1
-        atomic.AddInt64(&Stats.ErrorOutput, 1)
-    } else {
         s.kcp.stats.PacketOut += 1
         s.kcp.stats.ByteOut += int64(size)
         atomic.AddInt64(&Stats.PacketOut, 1)
         atomic.AddInt64(&Stats.ByteOut, int64(size))
+    } else {
+        //FIXME: what to do?
+        s.kcp.stats.ErrorOutput += 1
+        atomic.AddInt64(&Stats.ErrorOutput, 1)
     }
 }
 

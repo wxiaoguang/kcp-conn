@@ -4,80 +4,76 @@ import (
     "fmt"
     "log"
     "net"
-    _ "net/http"
-    _ "net/http/pprof"
     "sync"
     "testing"
     "time"
+    "io"
 )
 
-const port = "127.0.0.1:9999"
+var testServerAddr net.Addr
+var testServerListener *Listener
 
 func init() {
-    /*
-    go func() {
-        log.Println(http.ListenAndServe("localhost:6060", nil))
-    }()
-    */
-    go server()
-    <-time.After(200 * time.Millisecond)
-}
-
-func DialTest() (*KCPConn, error) {
-    return DialTimeout("udp", port, time.Second)
-}
-
-// all uncovered codes
-func TestCoverage(t *testing.T) {
-    DialTimeout("udp", "127.0.0.1:100000", time.Second)
-}
-
-func ListenTest() (net.Listener, error) {
-    return Listen(port)
-}
-
-func server() {
-    l, err := ListenTest()
+    ln, err := Listen(":")
+    testServerListener = ln.(*Listener)
+    testServerListener.SetReadBuffer(16 * 1024 * 1024)
+    testServerListener.SetWriteBuffer(16 * 1024 * 1024)
     if err != nil {
         panic(err)
     }
+    testServerAddr = testServerListener.Addr()
+    log.Println("listening on:", testServerAddr.String())
 
-    kcplistener := l.(*Listener)
-    kcplistener.SetReadBuffer(16 * 1024 * 1024)
-    kcplistener.SetWriteBuffer(16 * 1024 * 1024)
-    log.Println("listening on:", kcplistener.conn.LocalAddr())
+    go server()
+}
+
+func server() {
     for {
-        s, err := l.Accept()
+        c, err := testServerListener.Accept()
         if err != nil {
             panic(err)
         }
-
-        // coverage test
-        s.(*KCPConn).SetReadBuffer(16 * 1024 * 1024)
-        s.(*KCPConn).SetWriteBuffer(16 * 1024 * 1024)
-        s.(*KCPConn).SetKeepAlive(1)
-        go handleClient(s.(*KCPConn))
+        kcpConn := c.(*KCPConn)
+        kcpConn.SetNoDelay(1, 20, 2, 1)
+        kcpConn.SetWindowSize(1024, 1024) // faster
+        kcpConn.SetReadBuffer(16 * 1024 * 1024)
+        kcpConn.SetWriteBuffer(16 * 1024 * 1024)
+        kcpConn.SetKeepAlive(1)
+        go handleClient(c)
     }
 }
 
-func handleClient(conn *KCPConn) {
-    conn.SetNoDelay(1, 20, 2, 1)
-    conn.SetWindowSize(1024, 1024) // faster
+func DialTest() (*KCPConn, error) {
+    return DialTimeout("udp", testServerAddr.String(), time.Second)
+}
+
+// FIXME: all uncovered codes
+func TestCoverage(t *testing.T) {
+    DialTimeout("udp", testServerAddr.String(), time.Second)
+}
+
+func handleClient(conn net.Conn) {
     conn.SetReadDeadline(time.Now().Add(time.Hour))
     conn.SetWriteDeadline(time.Now().Add(time.Hour))
     //fmt.Println("new client", conn.RemoteAddr())
     buf := make([]byte, 65536)
     count := 0
+    recvSize := 0
     for {
         n, err := conn.Read(buf)
-        if err != nil {
+        if err != nil && err != io.EOF {
             panic(err)
         }
         if n == 0 {
+            log.Printf("server: %+v\n", conn.(*KCPConn).kcp.stats)
             break
         }
         count++
-        conn.Write(buf[:n])
+        recvSize += n
+        _, err = conn.Write(buf[:n])
+        if err != nil {
+            panic(err)
+        }
     }
     conn.Close()
 }
@@ -124,12 +120,12 @@ func TestSendRecv(t *testing.T) {
     const par = 1
     wg.Add(par)
     for i := 0; i < par; i++ {
-        go client(&wg)
+        go testSendRecvClient(&wg)
     }
     wg.Wait()
 }
 
-func client(wg *sync.WaitGroup) {
+func testSendRecvClient(wg *sync.WaitGroup) {
     cli, err := DialTest()
     if err != nil {
         panic(err)
@@ -155,76 +151,30 @@ func client(wg *sync.WaitGroup) {
     wg.Done()
 }
 
-/*
-This test case is wrong. we should never echo too much data (without read) to make the connection blocked
-func TestBigPacket(t *testing.T) {
-    var wg sync.WaitGroup
-    wg.Add(1)
-    go client2(&wg)
-    wg.Wait()
-}
-*/
-func client2(wg *sync.WaitGroup) {
-    cli, err := DialTest()
-    if err != nil {
-        panic(err)
-    }
-    cli.SetNoDelay(1, 20, 2, 1)
-    const N = 10
-    buf := make([]byte, 1024*512)
-    msg := make([]byte, 1024*512)
-    for i := 0; i < N; i++ {
-        cli.Write(msg)
-    }
-    println("total written:", len(msg)*N)
-
-    nrecv := 0
-    cli.SetReadDeadline(time.Now().Add(3 * time.Second))
-    for {
-        n, err := cli.Read(buf)
-        if err != nil {
-            break
-        } else {
-            nrecv += n
-            if nrecv == len(msg)*N {
-                break
-            }
-        }
-    }
-
-    println("total recv:", nrecv)
-    cli.Close()
-    wg.Done()
-}
-
 func TestSpeed(t *testing.T) {
     var wg sync.WaitGroup
     wg.Add(1)
-    go client3(&wg)
+    go testSpeedClient(&wg, 1, 4096, 4096 * 10)
     wg.Wait()
 }
 
-
-func client3(wg *sync.WaitGroup) {
+func testSpeedClient(wg *sync.WaitGroup, nc, msgSize, count int) {
     cli, err := DialTest()
     if err != nil {
         panic(err)
     }
-    log.Println("remote:", cli.RemoteAddr(), "local:", cli.LocalAddr())
-    log.Println("conv:", cli.GetConv())
+    log.Println("remote:", cli.RemoteAddr(), "local:", cli.LocalAddr(), "conv:", cli.GetConv(), "expected size:", msgSize * count)
     cli.SetWindowSize(1024, 1024)
-    cli.SetNoDelay(1, 20, 2, 1)
+    cli.SetNoDelay(1, 20, 2, nc)
     start := time.Now()
 
-    msgSize := 4096
-    count := 4096 * 10
     go func() {
         buf := make([]byte, 1024*1024)
         nrecv := 0
         for {
             n, err := cli.Read(buf)
             if err != nil {
-                fmt.Println(err)
+                log.Println(err)
                 break
             } else {
                 nrecv += n
@@ -234,12 +184,17 @@ func client3(wg *sync.WaitGroup) {
                 }
             }
         }
+
         println("total recv:", nrecv)
         cli.Close()
         mb := (float64(msgSize)*float64(count)/1024.0/1024.0)
-        time := time.Now().Sub(start)
-        fmt.Printf("time for %.2f MB : %v, speed=%.2f MB/s\n", mb, time, mb / time.Seconds())
-        fmt.Printf("%+v\n", Stats)
+        d := time.Now().Sub(start)
+
+        <- time.After(500 * time.Millisecond)
+
+        log.Printf("time for %.2f MB : %v, speed=%.2f MB/s\n", mb, d, mb / d.Seconds())
+        log.Printf("client: %+v\n", cli.kcp.stats)
+        log.Printf("stats: %+v\n", Stats)
         wg.Done()
     }()
     msg := make([]byte, msgSize)
@@ -253,15 +208,15 @@ func TestParallel(t *testing.T) {
     par := 200
     var wg sync.WaitGroup
     wg.Add(par)
-    fmt.Println("testing parallel", par, "connections")
+    log.Println("testing parallel", par, "connections")
     for i := 0; i < par; i++ {
-        go client4(i, &wg)
+        go testParallelClient(i, &wg)
     }
     wg.Wait()
-    fmt.Println("testing parallel", par, "connections done")
+    log.Println("testing parallel", par, "connections done")
 }
 
-func client4(idx int, wg *sync.WaitGroup) {
+func testParallelClient(idx int, wg *sync.WaitGroup) {
     cli, err := DialTest()
     if err != nil {
         panic(err)

@@ -3,16 +3,14 @@ package kcp
 import (
     "net"
     "time"
-    "bytes"
     "io"
 )
 
-type lossyConn struct {
-    conn net.Conn
+type lossyPacketConn struct {
+    conn net.PacketConn
 
     chRead chan interface{}
     chReadTricked chan interface{}
-    readBuf *bytes.Buffer
 
     chWrite chan interface{}
     chWriteTricked chan interface{}
@@ -23,21 +21,25 @@ type lossyConn struct {
     die chan struct{}
 }
 
-func NewLossyConn(conn net.Conn, channelSize int, readTrick, writeTrick LossyTrick) *lossyConn {
-    c := &lossyConn{conn: conn}
+type lossyPacket struct {
+    data []byte
+    addr net.Addr
+}
+
+func NewLossyConn(conn net.PacketConn, channelSize int, readTrick, writeTrick LossyTrick) *lossyPacketConn {
+    c := &lossyPacketConn{conn: conn}
 
     c.die = make(chan struct{}, 1)
     c.chRead = make(chan interface{}, channelSize)
     c.chReadTricked = LossyChannel("read", c.chRead, channelSize, readTrick)
-    c.readBuf = &bytes.Buffer{}
 
     c.chWrite = make(chan interface{}, channelSize)
     c.chWriteTricked = LossyChannel("write", c.chWrite, channelSize, writeTrick)
 
     go func() {
         for v := range c.chWriteTricked {
-            b := v.([]byte)
-            c.conn.Write(b)
+            p := v.(*lossyPacket)
+            c.conn.WriteTo(p.data, p.addr)
         }
     }()
 
@@ -46,7 +48,7 @@ func NewLossyConn(conn net.Conn, channelSize int, readTrick, writeTrick LossyTri
         for c.chWrite != nil {
             b := make([]byte, 4 * 1024)
             c.conn.SetReadDeadline(time.Now().Add(900 * time.Millisecond))
-            n, err := c.conn.Read(b)
+            n, addr, err := c.conn.ReadFrom(b)
             if e, ok := err.(net.Error); ok && e.Timeout() {
                 continue
             }
@@ -55,8 +57,9 @@ func NewLossyConn(conn net.Conn, channelSize int, readTrick, writeTrick LossyTri
                 break loop
             }
 
+            p := &lossyPacket{data: b, addr: addr}
             select {
-            case c.chRead <- b[:n]:
+            case c.chRead <- p:
             case <- c.die:
                 break loop
             }
@@ -67,18 +70,12 @@ func NewLossyConn(conn net.Conn, channelSize int, readTrick, writeTrick LossyTri
     return c
 }
 
-
-func (c *lossyConn) Read(b []byte) (n int, err error) {
-    n, _ = c.readBuf.Read(b)
-    if n != 0 {
-        return n, nil
-    }
-
+func (c *lossyPacketConn) ReadFrom(b []byte) (n int, addr net.Addr, err error) {
     var timer *time.Timer
     if !c.deadlineRead.IsZero() {
         delay := c.deadlineRead.Sub(time.Now())
         if delay <= 0 {
-            return 0, errTimeout{}
+            return 0, nil, errTimeout{}
         }
         timer = time.NewTimer(delay)
     } else {
@@ -88,12 +85,16 @@ func (c *lossyConn) Read(b []byte) (n int, err error) {
     select {
     case v := <- c.chReadTricked:
         if v == nil {
-            return 0, io.EOF
+            return 0, nil, io.EOF
         }
 
-        p := v.([]byte)
-        n, _ = c.readBuf.Write(p)
-        n, _ = c.readBuf.Read(b)
+        p := v.(*lossyPacket)
+        if len(b) < len(p.data) {
+            panic("buffer too small")
+        }
+        copy(b, p.data)
+        return len(p.data), p.addr, nil
+
     case <-timer.C:
         n = 0
         err = errTimeout{}
@@ -105,7 +106,7 @@ func (c *lossyConn) Read(b []byte) (n int, err error) {
     return
 }
 
-func (c *lossyConn) Write(b []byte) (n int, err error) {
+func (c *lossyPacketConn) WriteTo(b []byte, addr net.Addr) (n int, err error) {
     var timer *time.Timer
     if !c.deadlineWrite.IsZero() {
         delay := c.deadlineWrite.Sub(time.Now())
@@ -117,8 +118,12 @@ func (c *lossyConn) Write(b []byte) (n int, err error) {
         timer = &time.Timer{}
     }
 
+    p := &lossyPacket{}
+    p.data = make([]byte, len(b))
+    copy(p.data, b)
+    p.addr = addr
     select {
-    case c.chWrite <- b:
+    case c.chWrite <- p:
         n = len(b)
         err = nil
     case <-timer.C:
@@ -132,9 +137,7 @@ func (c *lossyConn) Write(b []byte) (n int, err error) {
     return
 }
 
-// Close closes the connection.
-// Any blocked Read or Write operations will be unblocked and return errors.
-func (c *lossyConn) Close() error {
+func (c *lossyPacketConn) Close() error {
     close(c.die)
 
     if c.chWrite != nil {
@@ -145,47 +148,96 @@ func (c *lossyConn) Close() error {
     return c.conn.Close()
 }
 
-// LocalAddr returns the local network address.
-func (c *lossyConn) LocalAddr() net.Addr {
+func (c *lossyPacketConn) LocalAddr() net.Addr {
     return c.conn.LocalAddr()
 }
 
-// RemoteAddr returns the remote network address.
-func (c *lossyConn) RemoteAddr() net.Addr {
-    return c.conn.RemoteAddr()
-}
-
-// SetDeadline sets the read and write deadlines associated
-// with the connection. It is equivalent to calling both
-// SetReadDeadline and SetWriteDeadline.
-//
-// A deadline is an absolute time after which I/O operations
-// fail with a timeout (see type Error) instead of
-// blocking. The deadline applies to all future I/O, not just
-// the immediately following call to Read or Write.
-//
-// An idle timeout can be implemented by repeatedly extending
-// the deadline after successful Read or Write calls.
-//
-// A zero value for t means I/O operations will not time out.
-func (c *lossyConn) SetDeadline(t time.Time) error {
+func (c *lossyPacketConn) SetDeadline(t time.Time) error {
     c.deadlineRead = t
     c.deadlineWrite = t
     return c.conn.SetDeadline(t)
 }
 
-// SetReadDeadline sets the deadline for future Read calls.
-// A zero value for t means Read will not time out.
-func (c *lossyConn) SetReadDeadline(t time.Time) error {
+func (c *lossyPacketConn) SetReadDeadline(t time.Time) error {
     c.deadlineRead = t
     return c.conn.SetReadDeadline(t)
 }
 
-// SetWriteDeadline sets the deadline for future Write calls.
-// Even if write times out, it may return n > 0, indicating that
-// some of the data was successfully written.
-// A zero value for t means Write will not time out.
-func (c *lossyConn) SetWriteDeadline(t time.Time) error {
+func (c *lossyPacketConn) SetWriteDeadline(t time.Time) error {
     c.deadlineWrite = t
     return c.conn.SetWriteDeadline(t)
+}
+
+
+
+
+type lossyPairConn struct {
+    chRead chan interface{}
+    chWrite chan interface{}
+}
+
+func NewLossyPairConn(sz int, lossyTrick1, lossyTrick2 LossyTrick) (net.PacketConn, net.PacketConn) {
+    ch12 := make(chan interface{}, sz)
+    ch21 := make(chan interface{}, sz)
+
+    c1 := &lossyPairConn{
+        chRead: LossyChannel("1.read", ch21, sz, lossyTrick2),
+        chWrite: ch12,
+    }
+
+    c2 := &lossyPairConn{
+        chRead: LossyChannel("2.read", ch12, sz, lossyTrick1),
+        chWrite: ch21,
+    }
+    return c1, c2
+}
+
+func (c *lossyPairConn) ReadFrom(b []byte) (int, net.Addr, error) {
+    v := <- c.chRead
+    if v == nil {
+        return 0, nil, io.EOF
+    }
+
+    p := v.([]byte)
+    if len(b) < len(p) {
+        panic("buffer too small")
+    }
+    copy(b, p)
+    //log.Printf("ReadFrom %d %+v\n", len(p), p[:24])
+    return len(p), nil, nil
+}
+
+func (c *lossyPairConn) WriteTo(b []byte, addr net.Addr) (int, error) {
+    //log.Printf("WriteTo %d %+v\n", len(b), b[:24])
+    p := make([]byte, len(b))
+    copy(p, b)
+    select {
+        case c.chWrite <- p:
+            return len(p), nil
+        default:
+            //print("lossyPairConn write lost")
+
+    }
+    return 0, io.ErrShortWrite
+}
+
+func (c *lossyPairConn) Close() error {
+    close(c.chWrite)
+    return nil
+}
+
+func (c *lossyPairConn) LocalAddr() net.Addr {
+    return nil
+}
+
+func (c *lossyPairConn) SetDeadline(t time.Time) error {
+    return nil
+}
+
+func (c *lossyPairConn) SetReadDeadline(t time.Time) error {
+    return nil
+}
+
+func (c *lossyPairConn) SetWriteDeadline(t time.Time) error {
+    return nil
 }

@@ -46,7 +46,6 @@ type KcpConnStats struct {
 	SegPushResendFast  int64
 	SegPushResendLost  int64
 	SegPushResendEarly int64
-
 }
 
 var Stats KcpGlobalStats

@@ -811,9 +811,11 @@ func (kcp *KCP) flush(current uint32) {
             copy(ptr, segment.data)
             ptr = ptr[len(segment.data):]
 
+            /*
             if segment.xmit >= kcp.dead_link {
                 kcp.state |= IKCP_STATE_DEAD
             }
+            */
         }
     }
 
