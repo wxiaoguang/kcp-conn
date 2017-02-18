@@ -22,14 +22,20 @@ func (c *BufferConn) BufferBytes() []byte { return c.buf.Bytes() }
 func (c *BufferConn) BufferLen() int { return c.buf.Len() }
 
 func (c *BufferConn) ReadToBuffer(sz int) (int, error) {
-    return c.conn.Read(c.buf.Extend(sz))
+    n, err := c.conn.Read(c.buf.Extend(sz))
+    if err == nil {
+        c.buf.Truncate(c.buf.Len() - (sz - n))
+    } else {
+        c.buf.Truncate(c.buf.Len() - sz)
+    }
+    return n, err
 }
 
 func (c *BufferConn) Read(b []byte) (int, error) {
     if c.buf.Len() > 0 {
         return c.buf.Read(b)
     }
-    return c.buf.Read(b)
+    return c.conn.Read(b)
 }
 
 func (c *BufferConn) Write(b []byte) (int, error) {
