@@ -39,6 +39,11 @@ void NcmConn::setEventCallback(const EventCallbackT &cb) {
 
 void NcmConn::doEventCallback(Event event, int err, size_t size) {
     if(!isClosedInternal) {
+        if(event == Event::Read) {
+            bytesRead += size;
+        } else if(event == Event::Write) {
+            bytesWritten += size;
+        }
         eventCallback(this, event, err, size);
     }
 }

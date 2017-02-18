@@ -31,6 +31,9 @@ public:
     struct evbuffer *inputBuffer = nullptr;
     struct evbuffer *outputBuffer = nullptr;
 
+    size_t bytesRead = 0;
+    size_t bytesWritten = 0;
+
     size_t inputBufferLength();
     size_t outputBufferLength();
     ssize_t outputFreeSpace();
