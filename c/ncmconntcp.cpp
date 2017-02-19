@@ -91,7 +91,7 @@ void NcmConnTcp::accept(int fd) {
     internal->fdConnected = true;
 }
 
-void NcmConnTcp::connectAsync(const char *ipPort) {
+void NcmConnTcp::connectAsync(const char *ipPort, int timeout) {
     sockaddr_storage ss;
     int ssLen = sizeof(ss);
     evutil_parse_sockaddr_port(ipPort, (sockaddr *) &ss, &ssLen);
@@ -103,7 +103,9 @@ void NcmConnTcp::connectAsync(const char *ipPort) {
     internal->fd = fd;
     internal->eventFdReadable = event_new(evbase, fd, EV_READ, Internal::evcbFdReadable, this);
     internal->eventFdWritable = event_new(evbase, fd, EV_WRITE, Internal::evcbFdWritable, this);
-    event_add(internal->eventFdWritable, nullptr);
+
+    struct timeval tv = {timeout, 0};
+    event_add(internal->eventFdWritable, timeout == 0 ? nullptr : &tv);
 }
 
 void NcmConnTcp::readAsync() {
@@ -173,11 +175,15 @@ void NcmConnTcp::Internal::evcbFdWritable(evutil_socket_t fd, short what, void *
     auto internal = conn->internal;
 
     if(!internal->fdConnected) {
-        internal->fdConnected = true;
-        conn->doEventCallback(Event::Connect, 0, 0);
+        if((what & EV_TIMEOUT) != 0) {
+            conn->doEventCallback(Event::Connect, ETIMEDOUT, 0);
+        } else {
+            internal->fdConnected = true;
+            conn->doEventCallback(Event::Connect, 0, 0);
+        }
     }
 
-    bool canDoCallback = false;
+    bool canDoCallback;
     if((what & EV_WRITE) != 0) {
         //activated by socket, or just connected, try to write more data
         int ret = internal->writeOutputToSocket(conn);

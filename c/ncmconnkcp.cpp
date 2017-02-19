@@ -30,6 +30,8 @@ public:
 
     int fd = -1;
     ikcpcb *kcp = nullptr;
+    uint32_t connectStartTimeMs = 0;
+    uint32_t connectTimeoutMs = 0;
 
     struct event *eventFdReadable = nullptr;
 
@@ -131,7 +133,7 @@ NcmConnKcp::~NcmConnKcp() {
     close();
 }
 
-void NcmConnKcp::connectAsync(const char *ipPort) {
+void NcmConnKcp::connectAsync(const char *ipPort, int timeout) {
     sockaddr_storage ss;
     int ssLen = sizeof(ss);
     evutil_parse_sockaddr_port(ipPort, (sockaddr *) &ss, &ssLen);
@@ -140,6 +142,8 @@ void NcmConnKcp::connectAsync(const char *ipPort) {
     evutil_make_socket_nonblocking(fd);
     connect(fd, (sockaddr *) &ss, (socklen_t) ssLen);
 
+    internal->connectStartTimeMs = currentMs();
+    internal->connectTimeoutMs = (uint32_t)timeout * 1000;
     internal->fd = fd;
     internal->eventFdReadable = event_new(evbase, fd, EV_READ | EV_PERSIST, Internal::evcbFdReadable, internal);
     event_add(internal->eventFdReadable, NULL);
@@ -321,13 +325,21 @@ void NcmConnKcp::Internal::evcbKcpUpdate(evutil_socket_t fd, short what, void *a
     auto kcp = internal->kcp;
     auto manager = internal->manager;
 
-    ikcp_update(kcp, currentMs());
+    auto now = currentMs();
+    ikcp_update(kcp, now);
 
     //printf("update: delay=%d, inputBufLen=%ld, outBufLen=%ld, nsnd_buf=%d, nsnd_que=%d, nrcv_buf=%d, nrcv_que=%d\n", internal->updateDelayMs, conn->inputBufferLength(), conn->outputBufferLength(), kcp->nsnd_buf, kcp->nsnd_que, kcp->nrcv_buf, kcp->nrcv_que);
     //printf("update: snd_nxt=%d, snd_una=%d, rcv_nxt=%d, \n", kcp->snd_nxt, kcp->snd_una, kcp->rcv_nxt);
     if(conn) {
-        //do nothing ....
+        //connection in use
+        if(internal->connectTimeoutMs != 0 && (now - internal->connectStartTimeMs > internal->connectTimeoutMs)) {
+            if(!ikcp_state_connected(kcp)) {
+                conn->doEventCallback(Event::Connect, ETIMEDOUT, 0);
+                internal->connectTimeoutMs = 0;
+            }
+        }
     } else {
+        //close waiting
         if (currentMs() - internal->closeTimeMs >= manager->internal->closeWaitMs) {
             //should be destroyed
             internal->manager->internal->deleteConnInternal(internal->manager, internal);

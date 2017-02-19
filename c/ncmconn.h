@@ -46,7 +46,7 @@ public:
     bool isClosed();
     void close();
 
-    virtual void connectAsync(const char *ipPort) = 0;
+    virtual void connectAsync(const char *ipPort, int timeout) = 0;
     virtual void readAsync() = 0;
     virtual void writeAsync() = 0;
     bool isClosable();

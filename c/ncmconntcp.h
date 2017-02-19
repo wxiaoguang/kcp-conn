@@ -14,7 +14,7 @@ public:
     ~NcmConnTcp();
 
     void accept(int fd);
-    virtual void connectAsync(const char *ipPort) override;
+    virtual void connectAsync(const char *ipPort, int timeout) override;
     virtual void readAsync() override;
     virtual void writeAsync() override;
 };
