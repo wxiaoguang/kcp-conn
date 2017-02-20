@@ -64,14 +64,14 @@ static void run(event_base *evbase) {
 
                         //connect to peer
                         if(strncmp(head, "CONNECT", 7) == 0) {
-                            peer->connectAsync(KCP_HTTPS_ADDR);
+                            peer->connectAsync(KCP_HTTPS_ADDR, 5);
 
                             evbuffer_add_printf(conn->outputBuffer, "HTTP/1.0 200 Connection established\r\n");
                             evbuffer_add_printf(conn->outputBuffer, "Proxy-Agent: demo\r\n");
                             evbuffer_add_printf(conn->outputBuffer, "\r\n");
                             conn->writeAsync();
                         } else {
-                            peer->connectAsync(KCP_HTTP_ADDR);
+                            peer->connectAsync(KCP_HTTP_ADDR, 5);
                             evbuffer_add(peer->outputBuffer, head, (size_t)headSize);
                             peer->writeAsync();
                         }

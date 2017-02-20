@@ -110,27 +110,32 @@ NcmConnKcp::NcmConnKcp(NcmConnKcpManager *manager, uint32_t conversationId) : Nc
     internal->kcp = ikcp_create(conversationId, internal);
     if(internal->kcp) {
         internal->kcp->output = Internal::kcpOutputWrapper;
-
-        //stream模式：多个包的内容合并数据发送。非stream模式：单个UDP包发送，不做数据合并。
         internal->kcp->stream = 1;
-
-        //1360的mtu适合绝大多数网络环境
-        ikcp_set_mtu(internal->kcp, 1360);
-
-        /*
-           - nodelay ：是否启用 nodelay模式，0不启用；1启用。
-           - interval ：协议内部工作的 interval，单位毫秒，比如 10ms或者 20ms
-           - resend ：快速重传模式，默认0关闭，可以设置2（2次ACK跨越将会直接重传）
-           - nc ：是否关闭流控，默认是0代表不关闭，1代表关闭。
-           - 普通模式：`ikcp_nodelay(kcp, 0, 40, 0, 0);
-           - 极速模式： ikcp_nodelay(kcp, 1, 10, 2, 1);
-         */
-        ikcp_set_nodelay(internal->kcp, 1, 20, 2, 1);
     }
 }
 
 NcmConnKcp::~NcmConnKcp() {
     close();
+}
+
+void NcmConnKcp::setKcpMtu(int mtu) {
+    ikcp_set_mtu(internal->kcp, mtu);
+}
+
+void NcmConnKcp::setKcpOptions(int noDelay, int interval, int resend, int noCwnd) {
+    /*
+       - nodelay ：是否启用 nodelay模式，0不启用；1启用。
+       - interval ：协议内部工作的 interval，单位毫秒，比如 10ms或者 20ms
+       - resend ：快速重传模式，默认0关闭，可以设置2（2次ACK跨越将会直接重传）
+       - nc ：是否关闭流控，默认是0代表不关闭，1代表关闭。
+       - 普通模式：`ikcp_nodelay(kcp, 0, 40, 0, 0);
+       - 极速模式： ikcp_nodelay(kcp, 1, 10, 2, 1);
+     */
+    ikcp_set_nodelay(internal->kcp, noDelay, interval, resend, noCwnd);
+}
+
+void NcmConnKcp::setKcpWnd(int sndWnd, int rcvWnd) {
+    ikcp_set_wnd(internal->kcp, sndWnd, rcvWnd);
 }
 
 void NcmConnKcp::connectAsync(const char *ipPort, int timeout) {
@@ -193,7 +198,7 @@ int NcmConnKcp::Internal::kcpOutputWrapper(const char *data, int len, struct IKC
 
 void NcmConnKcp::Internal::scheduleNextUpdate() {
     if (updateDelayMs >= 1000) updateDelayMs = 1000;
-    if (updateDelayMs <= 20) updateDelayMs = 20;
+    if (updateDelayMs < kcp->interval) updateDelayMs = kcp->interval;
 
     struct timeval tv = {0, (int)updateDelayMs * 1000};
     event_add(eventKcpUpdate, &tv);

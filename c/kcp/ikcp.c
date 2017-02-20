@@ -598,7 +598,7 @@ static void ikcp_update_ack(ikcpcb *kcp, IINT32 rtt)
 		kcp->rx_srtt = (7 * kcp->rx_srtt + rtt) / 8;
 		if (kcp->rx_srtt < 1) kcp->rx_srtt = 1;
 	}
-	rto = kcp->rx_srtt + _imax_(1, 4 * kcp->rx_rttval);
+	rto = kcp->rx_srtt + _imax_(kcp->interval, 4 * kcp->rx_rttval);
 	kcp->rx_rto = _ibound_(kcp->rx_minrto, rto, IKCP_RTO_MAX);
 }
 
@@ -1141,9 +1141,12 @@ void ikcp_flush(ikcpcb *kcp)
 				ptr += segment->len;
 			}
 
+			/*
+			 * if we are on a bandwidth limited net, there will be a lot of loss and xmit
 			if (segment->xmit >= kcp->dead_link) {
 				kcp->state |= IKCP_STATE_DEAD;
 			}
+			*/
 		}
 	}
 

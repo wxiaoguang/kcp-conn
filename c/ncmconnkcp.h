@@ -30,6 +30,9 @@ protected:
 
 public:
     ~NcmConnKcp();
+    void setKcpMtu(int mtu);
+    void setKcpOptions(int noDelay, int interval, int resend, int noCwnd);
+    void setKcpWnd(int sndWnd, int rcvWnd);
 
     virtual void connectAsync(const char *ipPort, int timeout) override;
     virtual void readAsync() override;
