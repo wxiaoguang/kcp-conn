@@ -29,8 +29,8 @@ size_t NcmConn::outputBufferLength() {
     return evbuffer_get_length(outputBuffer);
 }
 
-ssize_t NcmConn::outputFreeSpace() {
-    return OUTBUF_LIMIT - evbuffer_get_length(outputBuffer);
+int NcmConn::outputFreeSpace() {
+    return OUTBUF_LIMIT - (int)evbuffer_get_length(outputBuffer);
 }
 
 void NcmConn::setEventCallback(const EventCallbackT &cb) {

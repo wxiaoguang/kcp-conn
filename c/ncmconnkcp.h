@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ncmconn.h"
+#include <stdint.h>
 
 class NcmConnKcp;
 

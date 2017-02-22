@@ -36,7 +36,7 @@ public:
 
     size_t inputBufferLength();
     size_t outputBufferLength();
-    ssize_t outputFreeSpace();
+    int outputFreeSpace();
 
     NcmConn(struct event_base *evbase);
     virtual ~NcmConn();

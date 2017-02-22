@@ -98,7 +98,7 @@ void NcmConnTcp::connectAsync(const char *ipPort, int timeout) {
 
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     evutil_make_socket_nonblocking(fd);
-    connect(fd, (sockaddr *) &ss, (socklen_t) ssLen);
+    connect(fd, (sockaddr *) &ss, ssLen);
 
     internal->fd = fd;
     internal->eventFdReadable = event_new(evbase, fd, EV_READ, Internal::evcbFdReadable, this);

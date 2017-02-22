@@ -92,9 +92,13 @@ public:
 
 //FIXME: consider monotonic clock
 static inline uint32_t currentMs() {
+#ifdef WIN32
+    return GetTickCount();
+#else
     struct timeval time;
     gettimeofday(&time, NULL);
     return uint32_t((time.tv_sec * 1000) + (time.tv_usec / 1000));
+#endif
 }
 
 NcmConnKcp::NcmConnKcp(NcmConnKcpManager *manager, uint32_t conversationId) : NcmConn(manager->internal->evbase) {
@@ -145,7 +149,7 @@ void NcmConnKcp::connectAsync(const char *ipPort, int timeout) {
 
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     evutil_make_socket_nonblocking(fd);
-    connect(fd, (sockaddr *) &ss, (socklen_t) ssLen);
+    connect(fd, (sockaddr *) &ss, ssLen);
 
     internal->connectStartTimeMs = currentMs();
     internal->connectTimeoutMs = (uint32_t)timeout * 1000;
@@ -184,16 +188,16 @@ void NcmConnKcp::doClose() {
 }
 
 bool NcmConnKcp::Internal::isSndQueueWritable() {
-    return ikcp_waitsnd(kcp) < kcp->snd_wnd * 2;
+    return ikcp_waitsnd(kcp) < (int)kcp->snd_wnd * 2;
 }
 
 int NcmConnKcp::Internal::kcpOutputWrapper(const char *data, int len, struct IKCPCB *, void *user) {
     NcmConnKcp::Internal *internal = (NcmConnKcp::Internal *)user;
 
     //we do not care about failure here.
-    ssize_t n = send(internal->fd, data, (size_t)len, 0);
+    int n = (int)send(internal->fd, data, (size_t)len, 0);
 
-    return (int)n;
+    return n;
 }
 
 void NcmConnKcp::Internal::scheduleNextUpdate() {
@@ -255,7 +259,7 @@ void NcmConnKcp::Internal::feedOutputBufferWritable(NcmConnKcp *conn) {
         size_t len = evbuffer_get_length(conn->outputBuffer);
         if(len > 0) {
             int nvec = evbuffer_peek(conn->outputBuffer, -1, NULL, NULL, 0);
-            evbuffer_iovec eviovec[nvec];
+            evbuffer_iovec *eviovec = (evbuffer_iovec *)malloc(sizeof(evbuffer_iovec) * nvec);
             evbuffer_peek(conn->outputBuffer, -1, NULL, eviovec, nvec);
             for(int i = 0; i < nvec; i++) {
                 if (eviovec[i].iov_len > 0) {
@@ -264,6 +268,7 @@ void NcmConnKcp::Internal::feedOutputBufferWritable(NcmConnKcp *conn) {
                     if(!isSndQueueWritable()) break;
                 }
             }
+            free(eviovec);
             evbuffer_drain(conn->outputBuffer, sent);
 
             if(ikcp_sndbuf_avail(kcp) > 0) {
@@ -293,10 +298,10 @@ void NcmConnKcp::Internal::evcbFdReadable(evutil_socket_t fd, short what, void *
     int alreadyConnected = ikcp_state_connected(internal->kcp);
     int count = 0;
     while(true) {
-        uint8_t buf[2048];
-        ssize_t n = recv(fd, buf, sizeof(buf), 0);
+        char buf[2048];
+        int n = recv(fd, buf, sizeof(buf), 0);
         if(n <= 0) break;
-        ikcp_input(kcp, (char *)buf, n);
+        ikcp_input(kcp, buf, n);
         count++;
     }
 
