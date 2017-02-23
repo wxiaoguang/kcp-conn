@@ -288,7 +288,7 @@ void NcmConnKcp::Internal::feedOutputBufferWritable(NcmConnKcp *conn) {
     }
 }
 
-void NcmConnKcp::Internal::evcbFdReadable(evutil_socket_t fd, short what, void *arg) {
+void NcmConnKcp::Internal::evcbFdReadable(evutil_socket_t fd, short, void *arg) {
     NcmConnKcp::Internal *internal = (NcmConnKcp::Internal *)arg;
     auto conn = internal->conn;
     auto kcp = internal->kcp;
@@ -299,7 +299,7 @@ void NcmConnKcp::Internal::evcbFdReadable(evutil_socket_t fd, short what, void *
     int count = 0;
     while(true) {
         char buf[2048];
-        int n = recv(fd, buf, sizeof(buf), 0);
+        int n = (int)recv(fd, buf, sizeof(buf), 0);
         if(n <= 0) break;
         ikcp_input(kcp, buf, n);
         count++;
@@ -329,7 +329,7 @@ void NcmConnKcp::Internal::evcbFdReadable(evutil_socket_t fd, short what, void *
     internal->scheduleNextUpdate();
 }
 
-void NcmConnKcp::Internal::evcbKcpUpdate(evutil_socket_t fd, short what, void *arg) {
+void NcmConnKcp::Internal::evcbKcpUpdate(evutil_socket_t, short, void *arg) {
     NcmConnKcp::Internal *internal = (NcmConnKcp::Internal *)arg;
     auto conn = internal->conn;
     auto kcp = internal->kcp;
@@ -361,7 +361,7 @@ void NcmConnKcp::Internal::evcbKcpUpdate(evutil_socket_t fd, short what, void *a
     internal->scheduleNextUpdate();
 }
 
-void NcmConnKcp::Internal::evcbKcpReadWrite(evutil_socket_t fd, short what, void *arg) {
+void NcmConnKcp::Internal::evcbKcpReadWrite(evutil_socket_t, short what, void *arg) {
     NcmConnKcp::Internal *internal = (NcmConnKcp::Internal *)arg;
     auto conn = internal->conn;
 
@@ -409,7 +409,7 @@ void NcmConnKcpManager::setCloseWaitMs(uint32_t n) {
     internal->closeWaitMs = n;
 }
 
-void NcmConnKcpManager::Internal::closeConn(NcmConnKcpManager *manager, NcmConnKcp *conn) {
+void NcmConnKcpManager::Internal::closeConn(NcmConnKcpManager *, NcmConnKcp *conn) {
     auto connInternal = conn->internal;
     conn->internal = nullptr;
     connInternal->conn = nullptr;
@@ -420,7 +420,7 @@ void NcmConnKcpManager::Internal::closeConn(NcmConnKcpManager *manager, NcmConnK
     connInternals.push_back(connInternal);
 }
 
-void NcmConnKcpManager::Internal::deleteConnInternal(NcmConnKcpManager *manager, NcmConnKcp::Internal *connInternal) {
+void NcmConnKcpManager::Internal::deleteConnInternal(NcmConnKcpManager *, NcmConnKcp::Internal *connInternal) {
     connInternals.remove(connInternal);
     delete connInternal;
 }

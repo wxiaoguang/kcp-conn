@@ -12,33 +12,6 @@
 #define NCM_EVUTIL_ERR_RW_RETRIABLE(e) ((e) == EINTR || (e) == EAGAIN)
 #endif
 
-
-#ifdef _DEBUG
-    #define MAX_CONN_BUFFER_SIZE (800)
-    #define MAX_RESPONSE_HEADER (700)
-#else
-    #define MAX_CONN_BUFFER_SIZE (16*1024)
-    #define MAX_RESPONSE_HEADER (8*1024)
-
-    #ifdef __APPLE__
-        #include "TargetConditionals.h"
-        #if TARGET_IPHONE_SIMULATOR
-             // iOS Simulator
-        #elif TARGET_OS_IPHONE
-            //ios's memory is too little. do not use large buffer
-            #undef MAX_CONN_BUFFER_SIZE
-            #undef MAX_RESPONSE_HEADER
-            #define MAX_CONN_BUFFER_SIZE (1500)
-            #define MAX_RESPONSE_HEADER (1024)
-        #elif TARGET_OS_MAC
-            // Other kinds of Mac OS
-        #else
-            #error "Unknown Apple platform"
-        #endif
-    #endif
-#endif
-
-
 class NcmConnTcp::Internal {
 public:
     int fd = -1;
@@ -156,7 +129,7 @@ void NcmConnTcp::writeAsync() {
     }
 }
 
-void NcmConnTcp::Internal::evcbFdReadable(evutil_socket_t fd, short what, void *arg) {
+void NcmConnTcp::Internal::evcbFdReadable(evutil_socket_t fd, short, void *arg) {
     NcmConnTcp *conn = (NcmConnTcp *)arg;
     auto internal = conn->internal;
     auto len = evbuffer_read(conn->inputBuffer, fd, -1);
@@ -170,7 +143,7 @@ void NcmConnTcp::Internal::evcbFdReadable(evutil_socket_t fd, short what, void *
     }
 }
 
-void NcmConnTcp::Internal::evcbFdWritable(evutil_socket_t fd, short what, void *arg) {
+void NcmConnTcp::Internal::evcbFdWritable(evutil_socket_t, short what, void *arg) {
     NcmConnTcp *conn = (NcmConnTcp *)arg;
     auto internal = conn->internal;
 
