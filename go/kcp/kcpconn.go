@@ -180,7 +180,6 @@ func (s *KCPConn) Read(b []byte) (int, error) {
 
         shouldClose := s.kcp.shouldClose()
         if shouldClose {
-            //fmt.Printf("kcp Read should close\n")
             s.closeInternal()
         }
 
@@ -191,6 +190,7 @@ func (s *KCPConn) Read(b []byte) (int, error) {
         }
 
         if s.kcp.isStateLocalClosed() {
+            s.mu.Unlock()
             return 0, io.EOF
         }
 
@@ -412,7 +412,6 @@ func (s *KCPConn) run() {
     }
 
     atomic.AddInt64(&Stats.ConnClosing, 1)
-    //fmt.Printf("kcp conn close\n")
 
     if !s.kcp.isStateLocalClosed() {
         s.kcp.sendCloseFlush(currentTickMs())
