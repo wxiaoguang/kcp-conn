@@ -425,6 +425,7 @@ func (s *KCPConn) run() {
         s.kcp.update(currentTickMs())
         isRemoteClosed := s.kcp.isStateRemoteClosed()
         isDead := s.kcp.isStateDead()
+        isLocalClosed := s.kcp.isStateLocalClosed()
         if s.kcp.waitSnd() > 0 || !isRemoteClosed {
             updateDelay = 100 * time.Millisecond
         } else {
@@ -432,6 +433,11 @@ func (s *KCPConn) run() {
             dangling = false
         }
         s.mu.Unlock()
+
+        // local closed, do not wait for future packets, just close
+        if isLocalClosed {
+            break loopClose
+        }
 
         if isDead {
             break loopClose
@@ -686,6 +692,13 @@ func (l *Listener) server() {
             }
 
             if !ok {
+                // if the first cmd is not connect cmd, we ignore it
+                var cmd uint8
+                cmd = data[4]
+                if cmd != IKCP_CMD_CONNECT {
+                    udpPacketPool.Put(data)
+                    continue
+                }
                 // new session
                 conn = newKCPConn()
                 conn.accept(conv, l, l.conn, from)
