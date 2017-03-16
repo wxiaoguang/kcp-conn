@@ -65,6 +65,7 @@ type (
         chUdpInput        chan []byte
 
         keepAliveInterval int32
+        keepAliveTimer    *time.Timer
         mu                sync.Mutex
     }
 
@@ -90,6 +91,7 @@ func newKCPConn() *KCPConn {
     s.chUdpInput = make(chan []byte, rxQueueLimit)
 
     s.keepAliveInterval = defaultKeepAliveInterval
+    s.keepAliveTimer = time.NewTimer(s.getKeepAliveInterval())
 
     s.kcp = newKCP()
     s.kcp.setWndSize(defaultWndSize, defaultWndSize)
@@ -159,12 +161,19 @@ func (s *KCPConn) debug() {
     }
 }
 
+func (s *KCPConn) getKeepAliveInterval() (time.Duration) {
+    if s.keepAliveInterval == 0 {
+        return math.MaxInt32 * time.Second
+    } else {
+        return time.Duration(s.keepAliveInterval) * time.Second
+    }
+}
 
 // Read implements the Conn Read method.
 func (s *KCPConn) Read(b []byte) (int, error) {
     for {
         s.mu.Lock()
-
+        s.keepAliveTimer.Reset(s.getKeepAliveInterval())
         if s.bufRead.Len() < len(b) {
             for {
                 n := s.kcp.recvSize();
@@ -180,7 +189,7 @@ func (s *KCPConn) Read(b []byte) (int, error) {
 
         shouldClose := s.kcp.shouldClose()
         if shouldClose {
-            //fmt.Printf("kcp Read should close\n")
+            log.Printf("Read call closeInternal udp local %s conv %d because shouldClose", s.conn.LocalAddr(), s.GetConv())
             s.closeInternal()
         }
 
@@ -213,6 +222,12 @@ func (s *KCPConn) Read(b []byte) (int, error) {
         case <-s.chReadEvent:
         case <-deadline:
         case <-s.die:
+        case <-s.keepAliveTimer.C:
+            if s.keepAliveInterval != 0 {
+                s.keepAliveTimer.Stop()
+                log.Printf("Read call Close udp local %s conv %d because keep alive timeout", s.conn.LocalAddr(), s.GetConv())
+                s.Close()
+            }
         }
 
         if timeout != nil {
@@ -229,6 +244,7 @@ func (s *KCPConn) canKcpSendInternal() bool {
 func (s *KCPConn) Write(b []byte) (int, error) {
     for {
         s.mu.Lock()
+        s.keepAliveTimer.Reset(s.getKeepAliveInterval())
         if s.kcp.isStateLocalClosed() {
             s.mu.Unlock()
             return 0, errors.New(errBrokenPipe)
@@ -271,6 +287,12 @@ func (s *KCPConn) Write(b []byte) (int, error) {
         case <-s.chWriteEvent:
         case <-deadline:
         case <-s.die:
+        case <-s.keepAliveTimer.C:
+            if s.keepAliveInterval != 0 {
+                s.keepAliveTimer.Stop()
+                log.Printf("Write call Close udp local %s conv %d because keep alive timeout", s.conn.LocalAddr(), s.GetConv())
+                s.Close()
+            }
         }
 
         if timeout != nil {
@@ -286,6 +308,7 @@ func (s *KCPConn) closeInternal() error {
     }
 
     close(s.die)
+    log.Printf("closeInternal call sendCloseFlush udp local %s conv %d ", s.conn.LocalAddr(), s.GetConv())
     s.kcp.sendCloseFlush(currentTickMs())
     return nil
 }
@@ -335,6 +358,7 @@ func (s *KCPConn) goRunClientRecv() {
                 select {
                 case s.chUdpInput <- data[:n]:
                 case <-s.die:
+                    return
                 }
             } else if err != nil {
                 //FIXME: what to do ?
@@ -367,6 +391,9 @@ func (s *KCPConn) run() {
     updateDelay := updateDelayMin
 
     doKcpFlush := false
+
+    updateTimer := time.NewTimer(updateDelay)
+
     loopMain:
     for s.kcp.isAllOpen() {
 
@@ -377,6 +404,8 @@ func (s *KCPConn) run() {
         if updateDelay < updateDelayMin {
             updateDelay = updateDelayMin
         }
+
+        updateTimer.Reset(updateDelay)
 
         s.mu.Lock()
 
@@ -404,7 +433,7 @@ func (s *KCPConn) run() {
             doKcpFlush = true
             updateDelay = updateDelay / 2
 
-        case <-time.After(updateDelay):
+        case <-updateTimer.C:
             updateDelay = updateDelay * 2
 
         case <-s.die:
@@ -416,6 +445,7 @@ func (s *KCPConn) run() {
     //fmt.Printf("kcp conn close\n")
 
     if !s.kcp.isStateLocalClosed() {
+        log.Printf("run call sendCloseFlush udp local %s conv %d because remote closed but local is open", s.conn.LocalAddr(), s.GetConv())
         s.kcp.sendCloseFlush(currentTickMs())
     }
 
@@ -434,6 +464,9 @@ func (s *KCPConn) run() {
             updateDelay = updateDelayMax
             dangling = false
         }
+
+        updateTimer.Reset(updateDelay)
+
         s.mu.Unlock()
 
         // local closed, do not wait for future packets, just close
@@ -460,7 +493,7 @@ func (s *KCPConn) run() {
         case data := <-s.chUdpInput:
             s.doKcpInput(data)
 
-        case <-time.After(updateDelay):
+        case <-updateTimer.C:
         }
     }
 
@@ -578,6 +611,9 @@ func (s *KCPConn) SetWriteBuffer(bytes int) error {
 // SetKeepAlive changes per-connection NAT keepalive interval; 0 to disable, default to 10s
 func (s *KCPConn) SetKeepAlive(interval int) {
     atomic.StoreInt32(&s.keepAliveInterval, int32(interval))
+    s.mu.Lock()
+    s.keepAliveTimer = time.NewTimer(s.getKeepAliveInterval())
+    s.mu.Unlock()
 }
 
 // GetConv gets conversation id of a session
@@ -838,30 +874,27 @@ func ServeConn(conn net.PacketConn) (*Listener, error) {
 // Dial connects to the remote address "raddr" on the network "udp"
 func DialTimeout(network, addr string, timeout time.Duration) (*KCPConn, error) {
 
-    chKcpConn := make(chan *KCPConn)
     var err error
 
+    var udpAddr *net.UDPAddr
+    var udpConn *net.UDPConn
+
+    udpAddr, err = net.ResolveUDPAddr(network, addr)
+    if err != nil {
+        return nil, err
+    }
+
+    udpConn, err = net.DialUDP(network, nil, udpAddr)
+    if err != nil {
+        return nil, err
+    }
+
+    var conv uint32
+    binary.Read(rand.Reader, binary.LittleEndian, &conv)
+    kcpConn := newKCPConn()
+
     go func() {
-        var udpAddr *net.UDPAddr
-        var udpConn *net.UDPConn
-
-        udpAddr, err = net.ResolveUDPAddr(network, addr)
-        if err != nil {
-            chKcpConn <- nil
-            return
-        }
-
-        udpConn, err = net.DialUDP(network, nil, udpAddr)
-        if err != nil {
-            chKcpConn <- nil
-            return
-        }
-
-        var conv uint32
-        binary.Read(rand.Reader, binary.LittleEndian, &conv)
-        kcpConn := newKCPConn()
         kcpConn.connect(conv,  &ConnectedUDPConn{udpConn, udpConn}, udpAddr)
-        chKcpConn <- kcpConn
     }()
 
 
@@ -870,9 +903,11 @@ func DialTimeout(network, addr string, timeout time.Duration) (*KCPConn, error) 
         deadline = time.After(timeout)
     }
     select {
-    case kcpConn := <-chKcpConn:
-        return kcpConn, err
+    case <-kcpConn.chWriteEvent:
+        return kcpConn, nil
     case <-deadline:
+        log.Printf("DialTimeout call Close udp local %s conv %d because connect timeout", kcpConn.conn.LocalAddr(), kcpConn.GetConv())
+        kcpConn.Close()
         return nil, errors.New("timeout")
     }
 }
