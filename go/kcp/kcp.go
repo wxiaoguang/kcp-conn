@@ -4,6 +4,7 @@ package kcp
 import (
     "encoding/binary"
     "sync/atomic"
+    "log"
 )
 
 const (
@@ -489,6 +490,9 @@ func (kcp *KCP) parse_data(newseg *segment) {
 
 // Input when you received a low level packet (eg. UDP packet), call it
 func (kcp *KCP) input(current uint32, data []byte, update_ack bool) int {
+    if len(kcp.rcv_queue) > 1024 {
+        log.Printf("rcv_queue > 1024 conv: %d len:%d", kcp.conv, len(kcp.rcv_queue))
+    }
     una := kcp.snd_una
     if len(data) < IKCP_OVERHEAD {
         return -1
@@ -529,6 +533,8 @@ func (kcp *KCP) input(current uint32, data []byte, update_ack bool) int {
             return -3
         }
 
+        //log.Printf("conv: %d cmd: %d frg: %d wnd: %d ts: %d sn: %d una: %d", conv, cmd, frg, wnd, ts, sn, una)
+
         kcp.rmt_wnd = uint32(wnd)
         kcp.parse_una(una)
         kcp.shrink_buf()
@@ -551,8 +557,8 @@ func (kcp *KCP) input(current uint32, data []byte, update_ack bool) int {
             recentack = ts
         } else if cmd == IKCP_CMD_PUSH {
             if _itimediff(sn, kcp.rcv_nxt+kcp.rcv_wnd) < 0 {
-                kcp.ack_push(sn, ts)
                 if _itimediff(sn, kcp.rcv_nxt) >= 0 {
+                    kcp.ack_push(sn, ts)
                     seg := kcp.newSegment(int(length))
                     seg.conv = conv
                     seg.cmd = uint32(cmd)
@@ -637,6 +643,9 @@ func (kcp *KCP) calc_cwnd() uint32 {
 
 // flush pending data
 func (kcp *KCP) flush(current uint32) {
+    if len(kcp.snd_buf) > 1024 {
+        log.Printf("snd_buf > 1024 conv: %d len:%d", kcp.conv, len(kcp.snd_buf))
+    }
     buffer := kcp.buffer
     change := 0
     lost := false
@@ -754,7 +763,8 @@ func (kcp *KCP) flush(current uint32) {
             needsend = true
             segment.xmit++
             segment.rto = kcp.rx_rto
-            segment.resendts = current + segment.rto
+            //segment.resendts = current + segment.rto
+            segment.resendts = current + kcp.interval
         } else if _itimediff(current, segment.resendts) >= 0 {
             needsend = true
             segment.xmit++
@@ -765,18 +775,22 @@ func (kcp *KCP) flush(current uint32) {
                 segment.rto += kcp.rx_rto / 2
             }
             segment.resendts = current + segment.rto
-            lost = true
-            lostSegs++
+            if segment.xmit > 2 {
+                lost = true
+                lostSegs++
+                //log.Printf("flush lost because resenddts sn: %d", segment.sn)
+            }
         } else if segment.fastack >= resent { // fast retransmit
-            lastsend := segment.resendts - segment.rto
-            if _itimediff(current, lastsend) >= int32(kcp.rx_rto/4) {
+            //lastsend := segment.resendts - segment.rto
+            //if _itimediff(current, lastsend) >= int32(kcp.rx_rto/4) {
                 needsend = true
                 segment.xmit++
                 segment.fastack = 0
                 segment.resendts = current + segment.rto
                 change++
                 fastRetransSegs++
-            }
+            //log.Printf("flush lost because fastack sn: %d", segment.sn)
+            //}
         } else if segment.fastack > 0 && !hasPending { // early retransmit
             lastsend := segment.resendts - segment.rto
             if _itimediff(current, lastsend) >= int32(kcp.rx_rto/4) {
@@ -794,15 +808,28 @@ func (kcp *KCP) flush(current uint32) {
             segment.wnd = seg.wnd
             segment.una = kcp.rcv_nxt
 
+            //if beginSeg == nil {
+            //    beginSeg = segment
+            //    endSeg = segment
+            //}
+
             size := len(buffer) - len(ptr)
             need := IKCP_OVERHEAD + len(segment.data)
 
             if size+need > kcp.mtu {
+                //log.Printf("flush send seg cmd: %d frg: %d wnd: %d ts: %d sn: %d una: %d to cmd: %d frg: %d wnd: %d ts: %d sn: %d una: %d",
+                //    beginSeg.cmd, beginSeg.frg, beginSeg.wnd, beginSeg.ts, beginSeg.sn, beginSeg.una,
+                //    endSeg.cmd, endSeg.frg, endSeg.wnd, endSeg.ts, endSeg.sn, endSeg.una)
+                //beginSeg = segment
+                //endSeg = segment
                 kcp.output(buffer, size)
                 ptr = buffer
             }
+            //} else {
+            //    endSeg = segment
+            //}
 
-            if segment.cmd == IKCP_CMD_PUSH && kcp.stats != nil {
+            if (segment.cmd == IKCP_CMD_PUSH || segment.cmd == IKCP_CMD_CONNECT) && kcp.stats != nil {
                 kcp.stats.SegPush ++
                 atomic.AddInt64(&Stats.SegPush, 1)
             }
@@ -829,6 +856,11 @@ func (kcp *KCP) flush(current uint32) {
     // flash remain segments
     size := len(buffer) - len(ptr)
     if size > 0 {
+        //if beginSeg != nil && endSeg != nil {
+        //    log.Printf("flush send seg cmd: %d frg: %d wnd: %d ts: %d sn: %d una: %d to cmd: %d frg: %d wnd: %d ts: %d sn: %d una: %d",
+        //        beginSeg.cmd, beginSeg.frg, beginSeg.wnd, beginSeg.ts, beginSeg.sn, beginSeg.una,
+        //        endSeg.cmd, endSeg.frg, endSeg.wnd, endSeg.ts, endSeg.sn, endSeg.una)
+        //}
         kcp.output(buffer, size)
     }
 
