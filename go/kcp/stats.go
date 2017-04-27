@@ -46,6 +46,9 @@ type KcpConnStats struct {
 	SegPushResendFast  int64
 	SegPushResendLost  int64
 	SegPushResendEarly int64
+	StartTime          uint32
+	EndTime            uint32
+	AliveTime          uint32
 }
 
 var Stats KcpGlobalStats

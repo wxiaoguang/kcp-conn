@@ -26,7 +26,7 @@ const (
     udpPacketSizeLimit       = 2048
     rxQueueLimit             = 8192
     defaultKeepAliveInterval = 10
-    kcpSendBufferLimit = 1024 * 1024
+    kcpSendBufferLimit       = 1024 * 1024
 )
 
 const (
@@ -47,22 +47,22 @@ func init() {
 type (
     // KCPConn defines a KCP session implemented by UDP
     KCPConn struct {
-        kcp               *KCP           // the core ARQ
-        listener          *Listener      // point to server listener if it's a server socket
-        isClient          bool
-        conn              net.PacketConn // the underlying packet socket
-        remoteAddr        net.Addr
+        kcp        *KCP      // the core ARQ
+        listener   *Listener // point to server listener if it's a server socket
+        isClient   bool
+        conn       net.PacketConn // the underlying packet socket
+        remoteAddr net.Addr
 
-        deadlineRead      time.Time
-        deadlineWrite     time.Time
+        deadlineRead  time.Time
+        deadlineWrite time.Time
 
-        bufRead           *Buffer
+        bufRead *Buffer
 
-        die               chan struct{}
-        chReadEvent       chan struct{}
-        chWriteEvent      chan struct{}
-        chKcpFlushEvent   chan struct{}
-        chUdpInput        chan []byte
+        die             chan struct{}
+        chReadEvent     chan struct{}
+        chWriteEvent    chan struct{}
+        chKcpFlushEvent chan struct{}
+        chUdpInput      chan []byte
 
         keepAliveInterval int32
         keepAliveTimer    *time.Timer
@@ -99,6 +99,8 @@ func newKCPConn() *KCPConn {
     s.kcp.stream = 1
     s.kcp.output = s.kcpOutput
     s.kcp.stats = &KcpConnStats{}
+    s.kcp.stats.StartTime = 0
+    s.kcp.stats.EndTime = 0
 
     //go s.debug()
     return s
@@ -123,31 +125,28 @@ func (s *KCPConn) connect(conv uint32, conn net.PacketConn, remote net.Addr) {
 
     s.goRunClientRecv()
     go s.run();
-
     s.mu.Lock()
     s.kcp.sendConnectFlush(currentTickMs())
     s.mu.Unlock()
-    <- s.chWriteEvent
+    <-s.chWriteEvent
 }
 
-func (s *KCPConn) dump() {
+func (s *KCPConn) Dump() {
     s.mu.Lock()
     role := "server"
     if s.isClient {
         role = "client"
     }
-
-    log.Printf("-- role=%s (%p) --\n", role, s)
-    log.Printf("stats: %+v\n", s.kcp.stats)
-    log.Printf("isLocalOpen=%v, isRemoteOpen=%v\n", !s.kcp.isStateLocalClosed(), s.kcp.isRemoteOpen())
-    log.Printf("snd_nxt=%d, WaitSnd=%d\n", s.kcp.snd_nxt, s.kcp.waitSnd())
-    log.Printf("rcv_nxt=%d, rcv_queue=%d, rcv_buf=%d\n", s.kcp.rcv_nxt, len(s.kcp.rcv_queue), len(s.kcp.rcv_buf))
+    s.kcp.stats.AliveTime = s.kcp.stats.EndTime - s.kcp.stats.StartTime
+    log.Printf("-- role=%s (%p) conv=%d -- stats: %+v, isLocalOpen=%v, isRemoteOpen=%v, snd_nxt=%d, WaitSnd=%d, rcv_nxt=%d, rcv_queue=%d, rcv_buf=%d\n",
+        role, s, s.GetConv(), s.kcp.stats, !s.kcp.isStateLocalClosed(), s.kcp.isRemoteOpen(), s.kcp.snd_nxt, s.kcp.waitSnd(), s.kcp.rcv_nxt, len(s.kcp.rcv_queue), len(s.kcp.rcv_buf))
     log.Println()
+    s.kcp.stats = &KcpConnStats{}
     s.mu.Unlock()
 }
 
 func (s *KCPConn) debug() {
-    loop:
+loop:
     for {
         select {
         case <-s.die:
@@ -156,7 +155,7 @@ func (s *KCPConn) debug() {
             break loop
 
         case <-time.After(time.Second):
-            s.dump()
+            s.Dump()
         }
     }
 }
@@ -172,7 +171,12 @@ func (s *KCPConn) getKeepAliveInterval() (time.Duration) {
 // Read implements the Conn Read method.
 func (s *KCPConn) Read(b []byte) (int, error) {
     for {
+        lockTime := currentTickMs()
         s.mu.Lock()
+        lockTime = currentTickMs() - lockTime
+        if lockTime > 10 {
+            log.Printf("conv: %d read lock time: %d", s.GetConv(), lockTime)
+        }
         s.keepAliveTimer.Reset(s.getKeepAliveInterval())
         if s.bufRead.Len() < len(b) {
             for {
@@ -181,6 +185,10 @@ func (s *KCPConn) Read(b []byte) (int, error) {
                     break
                 }
 
+                s.kcp.stats.EndTime = currentTickMs()
+                if s.kcp.stats.StartTime == 0 {
+                    s.kcp.stats.StartTime = currentTickMs()
+                }
                 s.kcp.recv(s.bufRead.Extend(n))
                 s.kcp.stats.ByteRx += int64(n)
                 atomic.AddInt64(&Stats.ByteRx, int64(n))
@@ -243,7 +251,12 @@ func (s *KCPConn) canKcpSendInternal() bool {
 // Write implements the Conn Write method.
 func (s *KCPConn) Write(b []byte) (int, error) {
     for {
+        lockTime := currentTickMs()
         s.mu.Lock()
+        lockTime = currentTickMs() - lockTime
+        if lockTime > 10 {
+            log.Printf("conv: %d write lock time: %d", s.GetConv(), lockTime)
+        }
         s.keepAliveTimer.Reset(s.getKeepAliveInterval())
         if s.kcp.isStateLocalClosed() {
             s.mu.Unlock()
@@ -251,6 +264,10 @@ func (s *KCPConn) Write(b []byte) (int, error) {
         }
 
         if s.canKcpSendInternal() {
+            if s.kcp.stats.StartTime == 0 {
+                s.kcp.stats.StartTime = currentTickMs()
+            }
+            //log.Printf("conv: %d write call send", s.GetConv())
             ret := s.kcp.send(b)
             s.mu.Unlock()
 
@@ -262,7 +279,7 @@ func (s *KCPConn) Write(b []byte) (int, error) {
             atomic.AddInt64(&Stats.ByteTx, int64(len(b)))
 
             if s.kcp.sndBufAvail() > 0 {
-            s.notifyFlushEvent()
+                s.notifyFlushEvent()
             }
 
             return len(b), nil
@@ -310,6 +327,9 @@ func (s *KCPConn) closeInternal() error {
     close(s.die)
     log.Printf("closeInternal call sendCloseFlush udp local %s conv %d ", s.conn.LocalAddr(), s.GetConv())
     s.kcp.sendCloseFlush(currentTickMs())
+    //if s.isClient {
+    //	s.conn.Close()
+    //}
     return nil
 }
 
@@ -317,12 +337,24 @@ func (s *KCPConn) closeInternal() error {
 func (s *KCPConn) Close() error {
     s.mu.Lock()
     defer s.mu.Unlock()
-
+    log.Printf("Close called conv:%d", s.kcp.conv)
     return s.closeInternal()
 }
 
-func (s *KCPConn) doKcpInput(data []byte) bool {
+func (s *KCPConn) IsClosed() bool {
     s.mu.Lock()
+    defer s.mu.Unlock()
+
+    return !s.kcp.isAllOpen()
+}
+
+func (s *KCPConn) doKcpInput(data []byte) bool {
+    lockTime := currentTickMs()
+    s.mu.Lock()
+    lockTime = currentTickMs() - lockTime
+    if lockTime > 10 {
+        log.Printf("conv: %d doKcpInput lock time: %d", s.GetConv(), lockTime)
+    }
     defer s.mu.Unlock()
 
     alreadyConnected := s.kcp.isStateConnected()
@@ -331,7 +363,7 @@ func (s *KCPConn) doKcpInput(data []byte) bool {
         atomic.AddInt64(&Stats.ErrorInput, 1)
     }
 
-    if !alreadyConnected && s.kcp.isStateConnected(){
+    if !alreadyConnected && s.kcp.isStateConnected() {
         s.kcp.sendConnectFlush(currentTickMs())
         s.notifyWriteEvent()
     }
@@ -378,7 +410,6 @@ func (s *KCPConn) run() {
         atomic.CompareAndSwapInt64(&Stats.ConnMax, connMax, connCurrent)
     }
 
-
     // TODO: NAT keep alive
     //var lastPing time.Time
     //ticker := time.NewTicker(5 * time.Second)
@@ -391,31 +422,68 @@ func (s *KCPConn) run() {
     updateDelay := updateDelayMin
 
     doKcpFlush := false
+    doKcpUpdate := false
 
     updateTimer := time.NewTimer(updateDelay)
 
-    loopMain:
+loopMain:
     for s.kcp.isAllOpen() {
 
-        if updateDelay > updateDelayMax {
-            updateDelay = updateDelayMax
-        }
+        select {
+        case data := <-s.chUdpInput:
+            //log.Printf("conv: %d run call flush because input", s.GetConv())
+            s.doKcpInput(data)
+            continue loopMain
+        //updateDelay = updateDelay / 2
 
-        if updateDelay < updateDelayMin {
-            updateDelay = updateDelayMin
+        case <-s.chKcpFlushEvent:
+            //log.Printf("conv: %d run call flush because flush event", s.GetConv())
+            doKcpFlush = true
+        //updateDelay = updateDelay / 2
+
+        case <-updateTimer.C:
+            //log.Printf("conv: %d run call flush because update timer", s.GetConv())
+            doKcpUpdate = true
+        //updateDelay = updateDelay * 2
+
+        case <-s.die:
+            break loopMain
         }
+        //if updateDelay > updateDelayMax {
+        //    updateDelay = updateDelayMax
+        //}
+        //
+        //if updateDelay < updateDelayMin {
+        //    updateDelay = updateDelayMin
+        //}
 
         updateTimer.Reset(updateDelay)
 
+        lockTime := currentTickMs()
         s.mu.Lock()
-
-        if s.kcp.sndBufAvail() > 0 {
-            doKcpFlush = true
+        lockTime = currentTickMs() - lockTime
+        if lockTime > 10 {
+            log.Printf("conv: %d run 0 lock time: %d", s.GetConv(), lockTime)
         }
 
+        //if s.kcp.sndBufAvail() > 0 {
+        //	doKcpFlush = true
+        //}
+
+        //if doKcpFlush {
+        //	log.Printf("conv: %d run call flush", s.GetConv())
+        //	s.kcp.flush(currentTickMs())
+        //} else {
+        //	log.Printf("conv: %d run call update", s.GetConv())
+        //	s.kcp.update(currentTickMs())
+        //}
+
         if doKcpFlush {
+            //log.Printf("conv: %d run call flush", s.GetConv())
             s.kcp.flush(currentTickMs())
-        } else {
+        }
+        if doKcpUpdate {
+            //log.Printf("conv: %d run call update", s.GetConv())
             s.kcp.update(currentTickMs())
         }
         if s.canKcpSendInternal() {
@@ -424,21 +492,26 @@ func (s *KCPConn) run() {
         s.mu.Unlock()
 
         doKcpFlush = false
-        select {
-        case data := <-s.chUdpInput:
-            s.doKcpInput(data)
-            updateDelay = updateDelay / 2
-
-        case <-s.chKcpFlushEvent:
-            doKcpFlush = true
-            updateDelay = updateDelay / 2
-
-        case <-updateTimer.C:
-            updateDelay = updateDelay * 2
-
-        case <-s.die:
-            break loopMain
-        }
+        doKcpUpdate = false
+        //select {
+        //case data := <-s.chUdpInput:
+        //	//log.Printf("conv: %d run call flush because input", s.GetConv())
+        //	s.doKcpInput(data)
+        ////updateDelay = updateDelay / 2
+        //
+        //case <-s.chKcpFlushEvent:
+        //	//log.Printf("conv: %d run call flush because flush event", s.GetConv())
+        //	doKcpFlush = true
+        ////updateDelay = updateDelay / 2
+        //
+        //case <-updateTimer.C:
+        ////log.Printf("conv: %d run call flush because update timer", s.GetConv())
+        //	doKcpUpdate = true
+        ////updateDelay = updateDelay * 2
+        //
+        //case <-s.die:
+        //	break loopMain
+        //}
     }
 
     atomic.AddInt64(&Stats.ConnClosing, 1)
@@ -451,9 +524,15 @@ func (s *KCPConn) run() {
 
     var closeWaitStartTime time.Time
     dangling := true
-    loopClose:
+loopClose:
     for {
+        lockTime := currentTickMs()
         s.mu.Lock()
+        lockTime = currentTickMs() - lockTime
+        if lockTime > 10 {
+            log.Printf("conv: %d run 1 lock time: %d", s.GetConv(), lockTime)
+        }
+        //log.Printf("conv: %d run close call update", s.GetConv())
         s.kcp.update(currentTickMs())
         isRemoteClosed := s.kcp.isStateRemoteClosed()
         isDead := s.kcp.isStateDead()
@@ -499,7 +578,7 @@ func (s *KCPConn) run() {
 
     if s.listener == nil {
         //client
-        s.conn.Close()
+        //s.conn.Close()
     } else {
         //server
         select {
@@ -515,7 +594,6 @@ func (s *KCPConn) run() {
         atomic.AddInt64(&Stats.TotalCloseDangling, 1)
     }
 }
-
 
 // LocalAddr returns the local network address. The Addr returned is shared by all invocations of LocalAddr, so do not modify it.
 func (s *KCPConn) LocalAddr() net.Addr {
@@ -643,6 +721,17 @@ func (s *KCPConn) notifyFlushEvent() {
 }
 
 func (s *KCPConn) kcpOutput(buf []byte, size int) {
+    //log.Printf("conv: %d kcpOutput called", s.GetConv())
+    //role := "server"
+    //if s.isClient {
+    //    role = "client"
+    //}
+    //s.kcp.stats.AliveTime = s.kcp.stats.EndTime - s.kcp.stats.StartTime
+    //log.Printf("-- role=%s (%p) conv=%d -- stats: %+v, isLocalOpen=%v, isRemoteOpen=%v, snd_nxt=%d, WaitSnd=%d, rcv_nxt=%d, rcv_queue=%d, rcv_buf=%d\n",
+    //    role, s, s.GetConv(),s.kcp.stats, !s.kcp.isStateLocalClosed(), s.kcp.isRemoteOpen(), s.kcp.snd_nxt, s.kcp.waitSnd(), s.kcp.rcv_nxt, len(s.kcp.rcv_queue), len(s.kcp.rcv_buf))
+    //log.Println()
+
+    s.kcp.stats.EndTime = currentTickMs()
     _, err := s.conn.WriteTo(buf[:size], s.remoteAddr)
 
     //mutex already locked
@@ -658,18 +747,17 @@ func (s *KCPConn) kcpOutput(buf []byte, size int) {
     }
 }
 
-
 type (
     // Listener defines a server listening for connections
     Listener struct {
-        conn                     net.PacketConn
-        sessions                 map[string]*KCPConn
-        chAccepts                chan *KCPConn
-        chDeadConns              chan *KCPConn
-        headerSize               int
-        die                      chan struct{}
-        rd                       atomic.Value
-        wd                       atomic.Value
+        conn        net.PacketConn
+        sessions    map[string]*KCPConn
+        chAccepts   chan *KCPConn
+        chDeadConns chan *KCPConn
+        headerSize  int
+        die         chan struct{}
+        rd          atomic.Value
+        wd          atomic.Value
     }
 
     packet struct {
@@ -682,7 +770,7 @@ type (
 func (l *Listener) server() {
     chPacket := make(chan packet, rxQueueLimit)
 
-    go func () {
+    go func() {
         for {
             data := udpPacketPool.Get().([]byte)[:udpPacketSizeLimit]
             if n, from, err := l.conn.ReadFrom(data); err == nil {
@@ -697,8 +785,7 @@ func (l *Listener) server() {
         }
     }()
 
-
-    loop:
+loop:
     for {
         select {
         case p := <-chPacket:
@@ -894,9 +981,8 @@ func DialTimeout(network, addr string, timeout time.Duration) (*KCPConn, error) 
     kcpConn := newKCPConn()
 
     go func() {
-        kcpConn.connect(conv,  &ConnectedUDPConn{udpConn, udpConn}, udpAddr)
+        kcpConn.connect(conv, &ConnectedUDPConn{udpConn, udpConn}, udpAddr)
     }()
-
 
     var deadline <-chan time.Time
     if timeout != 0 {

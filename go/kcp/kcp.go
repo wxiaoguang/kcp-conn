@@ -5,6 +5,7 @@ import (
     "encoding/binary"
     "sync/atomic"
     "log"
+    "math"
 )
 
 const (
@@ -28,8 +29,6 @@ const (
     IKCP_INTERVAL    = 100
     IKCP_OVERHEAD    = 24
     IKCP_DEADLINK    = 20
-    IKCP_THRESH_INIT = 2
-    IKCP_THRESH_MIN  = 2
     IKCP_PROBE_INIT  = 7000   // 7 secs to probe window size
     IKCP_PROBE_LIMIT = 120000 // up to 120 secs to probe window
 
@@ -37,6 +36,21 @@ const (
     IKCP_STATE_REMOTE_CLOSED    uint32 = 1 << 1
     IKCP_STATE_LOCAL_CLOSED     uint32 = 1 << 2
     IKCP_STATE_DEAD             uint32 = 1 << 3
+
+    IKCP_STATE_SPEED_NORMAL     uint8 = 0
+    IKCP_STATE_SPEED_TRY        uint8 = 1 << 1
+    IKCP_STATE_SPEED_DRAIN      uint8 = 1 << 2
+    IKCP_STATE_SPEED_RTT        uint8 = 1 << 3
+    IKCP_STATE_SPEED_DATA       uint8 = 1 << 4
+    IKCP_STATE_SPEED_CHECK_MAX  uint8 = 1 << 5
+    IKCP_STATE_SPEED_CHECK_MIN  uint8 = 1 << 6
+
+    IKCP_WND_SPEED_RTT          uint8 = 4
+    MAX_UINT32                  uint32 = ^uint32(0)
+    CWND_INCREASE_FACTOR        uint32 = 2
+    CWND_DECREASE_FACTOR        float32 = 0.75
+    RATE_RANGE                  float32 = 0.1
+    SPEEDMODEL_TIME_RATE        float32 = 0.02
 )
 
 // Output is a closure which captures conn and calls conn.Write
@@ -157,6 +171,30 @@ type KCP struct {
     buffer []byte
     output Output
     stats *KcpConnStats
+
+
+    speed_state uint8
+
+    min_rtt uint32
+    touch_min_rtt bool
+    speed_start_ts uint32
+    speed_next_start_ts uint32
+
+    wnd_lowbound_speed float32
+    wnd_lowbound       uint32
+    wnd_upbound_speed  float32
+    wnd_upbound        uint32
+    base_speed float32
+    base_speed_wnd uint32
+    current_ack_seg_cnt uint32
+
+    remote_speed_end_ts uint32
+    remote_speed_seg_cnt_in_rtt uint32
+
+    drain_begin_ts uint32
+    drain_end_ts uint32
+    cwnd_before_drain uint32
+    inflight uint32
 }
 
 type ackItem struct {
@@ -178,8 +216,16 @@ func newKCP() *KCP {
     kcp.rx_minrto = IKCP_RTO_MIN
     kcp.interval = IKCP_INTERVAL
     kcp.ts_flush = IKCP_INTERVAL
-    kcp.ssthresh = IKCP_THRESH_INIT
     kcp.dead_link = IKCP_DEADLINK
+
+    kcp.speed_state = IKCP_STATE_SPEED_NORMAL
+    kcp.cwnd = IKCP_WND_SND
+
+    kcp.base_speed_wnd = 0
+    kcp.base_speed = 0
+
+    kcp.speed_next_start_ts = 0
+    kcp.min_rtt = MAX_UINT32
     return kcp
 }
 
@@ -248,19 +294,7 @@ func (kcp *KCP) recv(buffer []byte) (n int) {
     kcp.rcv_queue = kcp.rcv_queue[count:]
 
     // move available data from rcv_buf -> rcv_queue
-    count = 0
-    for k := range kcp.rcv_buf {
-        seg := &kcp.rcv_buf[k]
-        if seg.sn == kcp.rcv_nxt && len(kcp.rcv_queue) < int(kcp.rcv_wnd) {
-            kcp.rcv_nxt++
-            count++
-        } else {
-            break
-        }
-    }
-    kcp.rcv_queue = append(kcp.rcv_queue, kcp.rcv_buf[:count]...)
-    kcp.rcv_buf = kcp.rcv_buf[count:]
-
+    kcp.appendRcvQueue()
     // fast recover
     if len(kcp.rcv_queue) < int(kcp.rcv_wnd) && fast_recover {
         // ready to send back IKCP_CMD_WINS in ikcp_flush
@@ -268,6 +302,23 @@ func (kcp *KCP) recv(buffer []byte) (n int) {
         kcp.probe |= IKCP_ASK_TELL
     }
     return
+}
+
+func (kcp *KCP) appendRcvQueue() {
+    count := 0
+    for k := range kcp.rcv_buf {
+        seg := kcp.rcv_buf[k]
+        if seg.sn == kcp.rcv_nxt && len(kcp.rcv_queue) < int(kcp.rcv_wnd) {
+            kcp.rcv_nxt++
+            count++
+            if seg.cmd == IKCP_CMD_PUSH {
+                kcp.rcv_queue = append(kcp.rcv_queue, seg)
+            }
+        } else {
+            break
+        }
+    }
+    kcp.rcv_buf = kcp.rcv_buf[count:]
 }
 
 // Send is user/upper level send, returns below zero for error
@@ -474,18 +525,7 @@ func (kcp *KCP) parse_data(newseg *segment) {
     }
 
     // move available data from rcv_buf -> rcv_queue
-    count := 0
-    for k := range kcp.rcv_buf {
-        seg := &kcp.rcv_buf[k]
-        if seg.sn == kcp.rcv_nxt && len(kcp.rcv_queue) < int(kcp.rcv_wnd) {
-            kcp.rcv_nxt++
-            count++
-        } else {
-            break
-        }
-    }
-    kcp.rcv_queue = append(kcp.rcv_queue, kcp.rcv_buf[:count]...)
-    kcp.rcv_buf = kcp.rcv_buf[count:]
+    kcp.appendRcvQueue()
 }
 
 // Input when you received a low level packet (eg. UDP packet), call it
@@ -493,7 +533,6 @@ func (kcp *KCP) input(current uint32, data []byte, update_ack bool) int {
     if len(kcp.rcv_queue) > 1024 {
         log.Printf("rcv_queue > 1024 conv: %d len:%d", kcp.conv, len(kcp.rcv_queue))
     }
-    una := kcp.snd_una
     if len(data) < IKCP_OVERHEAD {
         return -1
     }
@@ -541,11 +580,12 @@ func (kcp *KCP) input(current uint32, data []byte, update_ack bool) int {
 
         if cmd == IKCP_CMD_CONNECT {
             if kcp.rcv_nxt == 0 {
-                kcp.ack_push(sn, ts)
-                kcp.rcv_nxt++
-                kcp.state |= IKCP_STATE_CONNECTED
+            kcp.ack_push(sn, ts)
+            kcp.state |= IKCP_STATE_CONNECTED
             }
         } else if cmd == IKCP_CMD_ACK {
+            kcp.calc_min_rtt(sn, ts, current)
+
             kcp.parse_ack(sn)
             kcp.shrink_buf()
             if flag == 0 {
@@ -588,6 +628,8 @@ func (kcp *KCP) input(current uint32, data []byte, update_ack bool) int {
         data = data[length:]
     }
 
+    kcp.updateSpeedState(current)
+
     if flag != 0 && update_ack {
         kcp.parse_fastack(maxack)
         if _itimediff(current, recentack) >= 0 {
@@ -595,29 +637,23 @@ func (kcp *KCP) input(current uint32, data []byte, update_ack bool) int {
         }
     }
 
-    if _itimediff(kcp.snd_una, una) > 0 {
-        if kcp.cwnd < kcp.rmt_wnd {
-            mss := uint32(kcp.mss)
-            if kcp.cwnd < kcp.ssthresh {
-                kcp.cwnd++
-                kcp.incr += mss
-            } else {
-                if kcp.incr < mss {
-                    kcp.incr = mss
-                }
-                kcp.incr += (mss*mss)/kcp.incr + (mss / 16)
-                if (kcp.cwnd+1)*mss <= kcp.incr {
-                    kcp.cwnd++
-                }
-            }
-            if kcp.cwnd > kcp.rmt_wnd {
-                kcp.cwnd = kcp.rmt_wnd
-                kcp.incr = kcp.rmt_wnd * mss
-            }
-        }
+    kcp.calc_inflight()
+    return 0
+}
+
+func (kcp *KCP) calc_min_rtt(sn uint32, ts uint32, current uint32) {
+    rtt := current - ts
+    if rtt <=0 {
+        log.Printf("this can't happen current:%d ts:%d rtt:%d", current, ts, rtt)
+        return
     }
 
-    return 0
+    if kcp.min_rtt > rtt {
+        kcp.min_rtt = rtt
+        if kcp.isInSpeedNormal() {
+            kcp.touch_min_rtt = true
+        }
+    }
 }
 
 func (kcp *KCP) wnd_unused() int32 {
@@ -629,26 +665,23 @@ func (kcp *KCP) wnd_unused() int32 {
 
 func (kcp *KCP) sndBufAvail() int32 {
     cwnd := kcp.calc_cwnd()
-    return _itimediff(kcp.snd_una+cwnd, kcp.snd_nxt)
+    return _itimediff(cwnd, kcp.inflight)
 }
 
 func (kcp *KCP) calc_cwnd() uint32 {
-    // calculate window size
-    cwnd := _imin_(kcp.snd_wnd, kcp.rmt_wnd)
-    if kcp.nocwnd == 0 {
-        cwnd = _imin_(kcp.cwnd, cwnd)
-    }
-    return cwnd
+    return kcp.cwnd
 }
 
 // flush pending data
 func (kcp *KCP) flush(current uint32) {
+
+    kcp.updateSpeedState(current)
+
     if len(kcp.snd_buf) > 1024 {
         log.Printf("snd_buf > 1024 conv: %d len:%d", kcp.conv, len(kcp.snd_buf))
     }
     buffer := kcp.buffer
     change := 0
-    lost := false
 
     var seg segment
     seg.conv = kcp.conv
@@ -721,10 +754,12 @@ func (kcp *KCP) flush(current uint32) {
 
 
     // sliding window, controlled by snd_nxt && sna_una+cwnd
-    cwnd := kcp.calc_cwnd()
+    snd_buf_avail_count := kcp.sndBufAvail()
     count := 0
+
     for k := range kcp.snd_queue {
-        if _itimediff(kcp.snd_nxt, kcp.snd_una+cwnd) >= 0 {
+        snd_buf_avail_count--
+        if snd_buf_avail_count < 0 {
             break
         }
         newseg := kcp.snd_queue[k]
@@ -776,7 +811,6 @@ func (kcp *KCP) flush(current uint32) {
             }
             segment.resendts = current + segment.rto
             if segment.xmit > 2 {
-                lost = true
                 lostSegs++
                 //log.Printf("flush lost because resenddts sn: %d", segment.sn)
             }
@@ -801,6 +835,11 @@ func (kcp *KCP) flush(current uint32) {
                 change++
                 earlyRetransSegs++
             }
+        }
+
+        if kcp.isInSpeedRtt() && segment.xmit > 1 && lostSegs == 0 {
+            // rtt测速阶段，不快速重传，除非真的丢包
+            needsend = false
         }
 
         if needsend {
@@ -864,34 +903,8 @@ func (kcp *KCP) flush(current uint32) {
         kcp.output(buffer, size)
     }
 
-    // update ssthresh
-    // rate halving, https://tools.ietf.org/html/rfc6937
-    if change != 0 {
-        inflight := kcp.snd_nxt - kcp.snd_una
-        kcp.ssthresh = inflight / 2
-        if kcp.ssthresh < IKCP_THRESH_MIN {
-            kcp.ssthresh = IKCP_THRESH_MIN
-        }
-        kcp.cwnd = kcp.ssthresh + resent
-        kcp.incr = kcp.cwnd * uint32(kcp.mss)
-    }
-
-    // congestion control, https://tools.ietf.org/html/rfc5681
-    if lost {
-        kcp.ssthresh = cwnd / 2
-        if kcp.ssthresh < IKCP_THRESH_MIN {
-            kcp.ssthresh = IKCP_THRESH_MIN
-        }
-        kcp.cwnd = 1
-        kcp.incr = uint32(kcp.mss)
-    }
-
-    if kcp.cwnd < 1 {
-        kcp.cwnd = 1
-        kcp.incr = uint32(kcp.mss)
-    }
+    kcp.calc_inflight()
 }
-
 // Update updates state (call it repeatedly, every 10ms-100ms), or you can ask
 // ikcp_check when to call it again (without ikcp_input/_send calling).
 // 'current' - current timestamp in millisec.
@@ -1059,3 +1072,217 @@ func (kcp *KCP) shouldClose() bool {
     return (kcp.state & (IKCP_STATE_REMOTE_CLOSED | IKCP_STATE_LOCAL_CLOSED )) == IKCP_STATE_REMOTE_CLOSED
 }
 
+// speed related begin
+func (kcp *KCP) startSpeedModel(current uint32) {
+    kcp.touch_min_rtt = false
+    kcp.speed_next_start_ts = MAX_UINT32
+    kcp.speed_start_ts = current
+    kcp.inSpeedRtt()
+}
+
+func (kcp *KCP) resetSpeedModelStartState(current uint32) {
+    kcp.touch_min_rtt = false
+    kcp.speed_next_start_ts += kcp.speed_next_start_ts -kcp.speed_start_ts
+    kcp.speed_start_ts = current
+}
+
+func (kcp *KCP) calc_inflight() {
+    kcp.inflight = uint32(len(kcp.snd_buf))
+}
+
+func (kcp *KCP) isInSpeedNormal() bool {
+    return kcp.speed_state == IKCP_STATE_SPEED_NORMAL
+}
+
+func (kcp *KCP) isInSpeedData() bool {
+    return kcp.speed_state & IKCP_STATE_SPEED_DATA > 0
+}
+
+func (kcp *KCP) isInSpeedDrain() bool {
+    return kcp.speed_state & IKCP_STATE_SPEED_DRAIN > 0
+}
+
+func (kcp *KCP) isInSpeedTry() bool {
+    return kcp.speed_state & IKCP_STATE_SPEED_TRY > 0
+}
+
+func (kcp *KCP) isInSpeedRtt() bool {
+    return kcp.speed_state & IKCP_STATE_SPEED_RTT > 0
+}
+
+func (kcp *KCP) isInSpeedCheckMax() bool {
+    return kcp.speed_state & IKCP_STATE_SPEED_CHECK_MAX > 0
+}
+
+func (kcp *KCP) isInSpeedCheckMin() bool {
+    return kcp.speed_state & IKCP_STATE_SPEED_CHECK_MIN > 0
+}
+
+func (kcp *KCP) inSpeedDrain(current uint32) {
+    kcp.speed_state |= IKCP_STATE_SPEED_DRAIN
+    // drain模式不再向buf里填充数据
+    kcp.cwnd_before_drain = kcp.cwnd
+    kcp.cwnd = 0
+    kcp.drain_begin_ts = current
+}
+
+func (kcp *KCP) outSpeedDrain(current uint32) {
+    kcp.speed_state &= ^IKCP_STATE_SPEED_DRAIN
+    kcp.drain_end_ts = current
+}
+
+func (kcp *KCP) inSpeedTry() {
+    kcp.speed_state |= IKCP_STATE_SPEED_TRY
+    kcp.cwnd = 0
+}
+
+func (kcp *KCP) outSpeedTry() {
+    kcp.speed_state &= ^IKCP_STATE_SPEED_TRY
+}
+
+func (kcp *KCP) inSpeedRtt() {
+    kcp.speed_state |= IKCP_STATE_SPEED_RTT
+    kcp.cwnd = uint32(IKCP_WND_SPEED_RTT)
+}
+
+func (kcp *KCP) outSpeedRtt() {
+    kcp.speed_state &= ^IKCP_STATE_SPEED_RTT
+    if kcp.base_speed_wnd == 0 && kcp.base_speed == 0 {
+        // 第一次初始化
+        kcp.base_speed_wnd = uint32(IKCP_WND_SPEED_RTT)
+        // 速度是seg/second
+        kcp.base_speed = float32(kcp.base_speed_wnd * 1000) / float32(kcp.drain_end_ts - kcp.drain_begin_ts)
+    }
+}
+
+func (kcp *KCP) inSpeedData() {
+    // 进入测速模式，首先检测wnd_upbound
+    kcp.speed_state |= IKCP_STATE_SPEED_DATA | IKCP_STATE_SPEED_CHECK_MAX
+    kcp.cwnd = kcp.base_speed_wnd * CWND_INCREASE_FACTOR
+}
+
+func (kcp *KCP) outSpeedCheckMax() {
+    kcp.speed_state &= ^IKCP_STATE_SPEED_CHECK_MAX
+}
+
+func (kcp *KCP) inSpeedCheckMin() {
+    // 开始检测wnd_lowbound
+    kcp.speed_state |= IKCP_STATE_SPEED_CHECK_MIN
+    kcp.cwnd = uint32(float32(kcp.cwnd) * CWND_DECREASE_FACTOR)
+}
+
+func (kcp *KCP) outSpeedCheckMin() {
+    kcp.speed_state &= ^IKCP_STATE_SPEED_CHECK_MIN
+}
+
+func (kcp *KCP) outSpeedDate() {
+    kcp.speed_state &= ^IKCP_STATE_SPEED_DATA
+}
+
+func (kcp *KCP) updateSpeedState(current uint32) {
+    if kcp.speed_next_start_ts <= current {
+        // 到时间了，看看是不是需要测一轮
+        if kcp.touch_min_rtt {
+            kcp.resetSpeedModelStartState(current)
+        } else {
+            kcp.startSpeedModel(current)
+        }
+    } else if kcp.isInSpeedDrain() && len(kcp.snd_buf) == 0 {
+        // 已经排空buffer并且在drain的state
+        kcp.outSpeedDrain(current)
+        if kcp.isInSpeedTry() {
+            // 从try进入rtt测速阶段
+            kcp.outSpeedTry()
+            kcp.inSpeedRtt()
+        } else if kcp.isInSpeedRtt() {
+            // rtt测速完成，进入data测速阶段
+            kcp.outSpeedRtt()
+            kcp.inSpeedData()
+        } else {
+            // in speed data state
+            kcp.updateCwnd(current)
+        }
+    }
+}
+
+func (kcp *KCP) updateCwnd(current uint32) {
+    ts := kcp.drain_end_ts - kcp.drain_begin_ts
+    current_wnd := kcp.cwnd_before_drain
+    current_speed := float32(current_wnd * 1000) / float32(ts)
+
+    // 速度变化率
+    diff_speed_rate := (current_speed - kcp.base_speed) / kcp.base_speed
+
+    if kcp.isInSpeedCheckMax() {
+        if diff_speed_rate > RATE_RANGE {
+            // 速度变快了
+            kcp.cwnd = current_wnd * CWND_INCREASE_FACTOR
+        } else {
+            // 找到max了
+            kcp.wnd_upbound = current_wnd
+            kcp.wnd_upbound_speed = current_speed
+            kcp.outSpeedCheckMax()
+            kcp.inSpeedCheckMin()
+            kcp.cwnd = kcp.wnd_lowbound + (kcp.wnd_upbound - kcp.wnd_lowbound) / 2
+        }
+    } else if kcp.isInSpeedCheckMin() {
+        if diff_speed_rate > RATE_RANGE {
+            // 速度变快了
+            kcp.cwnd = uint32(float32(current_wnd) * CWND_DECREASE_FACTOR)
+        } else {
+            // 找到min了
+            kcp.wnd_lowbound = current_wnd
+            kcp.wnd_lowbound_speed = current_speed
+            kcp.outSpeedCheckMin()
+            // max min都测出来了，开始二分
+            kcp.cwnd = kcp.wnd_lowbound + (kcp.wnd_upbound - kcp.wnd_lowbound) / 2
+        }
+    } else {
+        // up lowbound都查出来了，开始精细定位了
+        if diff_speed_rate > RATE_RANGE {
+            if current_wnd > kcp.base_speed_wnd {
+                // 处于增长阶段，所以应该继续向着upbound增长
+                kcp.cwnd = current_wnd + (kcp.wnd_upbound - current_wnd) / 2
+            } else if current_wnd < kcp.base_speed_wnd{
+                // 处于减少阶段，所以应该继续向着lowbound减少
+                kcp.cwnd = current_wnd - (current_wnd - kcp.wnd_lowbound) / 2
+            }
+        } else if diff_speed_rate < -RATE_RANGE {
+            if current_wnd > kcp.base_speed_wnd {
+                // 处于增长阶段，所以找到新的upbound
+                kcp.wnd_upbound = current_wnd
+                kcp.wnd_upbound_speed = current_speed
+                kcp.cwnd = kcp.wnd_lowbound + (kcp.wnd_upbound - kcp.wnd_lowbound) / 2
+            } else if current_wnd < kcp.base_speed_wnd{
+                // 处于减少阶段，所以找到新的lowbound
+                kcp.wnd_lowbound = current_wnd
+                kcp.wnd_lowbound_speed = current_speed
+                kcp.cwnd = kcp.wnd_lowbound + (kcp.wnd_upbound - kcp.wnd_lowbound) / 2
+            }
+        } else {
+            // 没有变化， 取中间值
+            if current_wnd > kcp.base_speed_wnd {
+                kcp.cwnd = kcp.base_speed_wnd + (current_wnd - kcp.base_speed_wnd) / 2
+            } else if current_wnd < kcp.base_speed_wnd{
+                kcp.cwnd = current_wnd - (kcp.base_speed_wnd - current_wnd) / 2
+            }
+        }
+
+    }
+
+    log.Printf("current_wnd:%d current_speed:%f base_speed:%f base_speed_wnd:%d", current_wnd, current_speed, kcp.base_speed, kcp.base_speed_wnd)
+    kcp.base_speed = current_speed
+    kcp.base_speed_wnd = current_wnd
+
+    if math.Abs(float64(kcp.cwnd - current_wnd)) <= 1 {
+        kcp.stopSpeedModel(current)
+    }
+}
+
+func (kcp *KCP) stopSpeedModel(current uint32) {
+    kcp.speed_state = IKCP_STATE_SPEED_NORMAL
+    kcp.speed_next_start_ts = kcp.speed_start_ts + uint32(float32(current - kcp.speed_start_ts) / SPEEDMODEL_TIME_RATE)
+    log.Printf("stop speed model: cost:%d next start ts:%d current speed:%f current wnd:%d", current - kcp.speed_start_ts, kcp.speed_next_start_ts, kcp.base_speed, kcp.base_speed_wnd)
+}
+
+// speed related end
