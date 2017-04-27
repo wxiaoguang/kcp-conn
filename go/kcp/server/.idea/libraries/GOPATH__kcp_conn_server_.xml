@@ -1,0 +1,27 @@
+<component name="libraryTable">
+  <library name="GOPATH &lt;kcp-conn-server&gt;">
+    <CLASSES>
+      <root url="file://$PROJECT_DIR$/../github.com" />
+      <root url="file://$PROJECT_DIR$/../kcp-conn-client" />
+      <root url="file://$PROJECT_DIR$/../kcptunserver" />
+      <root url="file://$PROJECT_DIR$/../gopkg.in" />
+      <root url="file://$PROJECT_DIR$/../kcptunclient" />
+      <root url="file://$PROJECT_DIR$/../golang.org" />
+      <root url="file://$PROJECT_DIR$/../test" />
+      <root url="file://$PROJECT_DIR$/../kuaishou.com" />
+    </CLASSES>
+    <SOURCES>
+      <root url="file://$PROJECT_DIR$/../github.com" />
+      <root url="file://$PROJECT_DIR$/../kcp-conn-client" />
+      <root url="file://$PROJECT_DIR$/../kcptunserver" />
+      <root url="file://$PROJECT_DIR$/../gopkg.in" />
+      <root url="file://$PROJECT_DIR$/../kcptunclient" />
+      <root url="file://$PROJECT_DIR$/../golang.org" />
+      <root url="file://$PROJECT_DIR$/../test" />
+      <root url="file://$PROJECT_DIR$/../kuaishou.com" />
+    </SOURCES>
+    <excluded>
+      <root url="file://$PROJECT_DIR$" />
+    </excluded>
+  </library>
+</component>

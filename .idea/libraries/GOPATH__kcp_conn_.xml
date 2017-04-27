@@ -1,0 +1,29 @@
+<component name="libraryTable">
+  <library name="GOPATH &lt;kcp-conn&gt;">
+    <CLASSES>
+      <root url="file://$PROJECT_DIR$/../gopath/src/github.com" />
+      <root url="file://$PROJECT_DIR$/../gopath/src/kcp-conn-client" />
+      <root url="file://$PROJECT_DIR$/../gopath/src/kcptunserver" />
+      <root url="file://$PROJECT_DIR$/../gopath/src/kcp-conn-server" />
+      <root url="file://$PROJECT_DIR$/../gopath/src/gopkg.in" />
+      <root url="file://$PROJECT_DIR$/../gopath/src/kcptunclient" />
+      <root url="file://$PROJECT_DIR$/../gopath/src/golang.org" />
+      <root url="file://$PROJECT_DIR$/../gopath/src/test" />
+      <root url="file://$PROJECT_DIR$/../gopath/src/kuaishou.com" />
+    </CLASSES>
+    <SOURCES>
+      <root url="file://$PROJECT_DIR$/../gopath/src/github.com" />
+      <root url="file://$PROJECT_DIR$/../gopath/src/kcp-conn-client" />
+      <root url="file://$PROJECT_DIR$/../gopath/src/kcptunserver" />
+      <root url="file://$PROJECT_DIR$/../gopath/src/kcp-conn-server" />
+      <root url="file://$PROJECT_DIR$/../gopath/src/gopkg.in" />
+      <root url="file://$PROJECT_DIR$/../gopath/src/kcptunclient" />
+      <root url="file://$PROJECT_DIR$/../gopath/src/golang.org" />
+      <root url="file://$PROJECT_DIR$/../gopath/src/test" />
+      <root url="file://$PROJECT_DIR$/../gopath/src/kuaishou.com" />
+    </SOURCES>
+    <excluded>
+      <root url="file://$PROJECT_DIR$" />
+    </excluded>
+  </library>
+</component>
