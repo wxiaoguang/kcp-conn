@@ -488,6 +488,12 @@ func (s *KCPConn) RemoteAddr() net.Addr {
 
 // SetDeadline sets the deadline associated with the listener. A zero time value disables the deadline.
 func (s *KCPConn) SetDeadline(t time.Time) error {
+    if !t.IsZero() && t.Before(time.Now()) {
+        s.chReadEvent <- struct{}{}
+        s.chWriteEvent <- struct{}{}
+        return nil
+    }
+
     s.mu.Lock()
     defer s.mu.Unlock()
     s.deadlineRead = t
@@ -497,6 +503,11 @@ func (s *KCPConn) SetDeadline(t time.Time) error {
 
 // SetReadDeadline implements the Conn SetReadDeadline method.
 func (s *KCPConn) SetReadDeadline(t time.Time) error {
+    if !t.IsZero() && t.Before(time.Now()) {
+        s.chReadEvent <- struct{}{}
+        return nil
+    }
+
     s.mu.Lock()
     defer s.mu.Unlock()
     s.deadlineRead = t
@@ -505,6 +516,11 @@ func (s *KCPConn) SetReadDeadline(t time.Time) error {
 
 // SetWriteDeadline implements the Conn SetWriteDeadline method.
 func (s *KCPConn) SetWriteDeadline(t time.Time) error {
+    if !t.IsZero() && t.Before(time.Now()) {
+        s.chWriteEvent <- struct{}{}
+        return nil
+    }
+
     s.mu.Lock()
     defer s.mu.Unlock()
     s.deadlineWrite = t
