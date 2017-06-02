@@ -493,10 +493,8 @@ func (s *KCPConn) SetDeadline(t time.Time) error {
     s.deadlineRead = t
     s.deadlineWrite = t
 
-    if !t.IsZero() && t.Before(time.Now()) {
-        s.chReadEvent <- struct{}{}
-        s.chWriteEvent <- struct{}{}
-    }
+    s.chReadEvent <- struct{}{}
+    s.chWriteEvent <- struct{}{}
 
     return nil
 }
@@ -507,9 +505,7 @@ func (s *KCPConn) SetReadDeadline(t time.Time) error {
     defer s.mu.Unlock()
     s.deadlineRead = t
 
-    if !t.IsZero() && t.Before(time.Now()) {
-        s.chReadEvent <- struct{}{}
-    }
+    s.chReadEvent <- struct{}{}
 
     return nil
 }
@@ -520,9 +516,7 @@ func (s *KCPConn) SetWriteDeadline(t time.Time) error {
     defer s.mu.Unlock()
     s.deadlineWrite = t
 
-    if !t.IsZero() && t.Before(time.Now()) {
-        s.chWriteEvent <- struct{}{}
-    }
+    s.chWriteEvent <- struct{}{}
 
     return nil
 }
