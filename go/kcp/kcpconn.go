@@ -493,8 +493,8 @@ func (s *KCPConn) SetDeadline(t time.Time) error {
     s.deadlineRead = t
     s.deadlineWrite = t
 
-    s.chReadEvent <- struct{}{}
-    s.chWriteEvent <- struct{}{}
+    s.notifyReadEvent()
+    s.notifyWriteEvent()
 
     return nil
 }
@@ -505,7 +505,7 @@ func (s *KCPConn) SetReadDeadline(t time.Time) error {
     defer s.mu.Unlock()
     s.deadlineRead = t
 
-    s.chReadEvent <- struct{}{}
+    s.notifyReadEvent()
 
     return nil
 }
@@ -516,7 +516,7 @@ func (s *KCPConn) SetWriteDeadline(t time.Time) error {
     defer s.mu.Unlock()
     s.deadlineWrite = t
 
-    s.chWriteEvent <- struct{}{}
+    s.notifyWriteEvent()
 
     return nil
 }
