@@ -417,7 +417,7 @@ func (s *KCPConn) run() {
         s.kcp.sendCloseFlush(currentTickMs())
     }
 
-    var closeWaitStartTime time.Time
+    closeWaitStartTime := time.Now()
     dangling := true
     loopClose:
     for {
@@ -433,19 +433,9 @@ func (s *KCPConn) run() {
         }
         s.mu.Unlock()
 
-        if isDead {
+        isCloseWaitTimeout := math.Abs(time.Now().Sub(closeWaitStartTime).Seconds()) >= 5
+        if isDead || isCloseWaitTimeout {
             break loopClose
-        }
-
-        if isRemoteClosed {
-            if closeWaitStartTime.IsZero() {
-                closeWaitStartTime = time.Now()
-            }
-
-            //FIXME: consider monotonic clock
-            if math.Abs(time.Now().Sub(closeWaitStartTime).Seconds()) >= 5 {
-                break loopClose
-            }
         }
 
         select {
